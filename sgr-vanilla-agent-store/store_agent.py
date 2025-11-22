@@ -1,10 +1,14 @@
 import time
+from pathlib import Path
 from typing import Annotated, List, Union, Literal
 from annotated_types import MaxLen, MinLen
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from erc3 import store, ApiException, TaskInfo, ERC3
 from openai import OpenAI
 
+# Ensure API keys are loaded before creating the OpenAI client
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 client = OpenAI()
 
 class ReportTaskCompletion(BaseModel):
@@ -36,7 +40,7 @@ You are a business assistant helping customers of OnlineStore.
 
 - Clearly report when tasks are done.
 - If ListProducts returns non-zero "NextOffset", it means there are more products available.
-- You can apply coupon codes to get discounts. Use ViewBasket to see current discount and total.
+- You can apply coupon codes to get discounts. Some of them dont work Use ViewBasket to see current discount and total.
 - Only one coupon can be applied at a time. Apply a new coupon to replace the current one, or remove it explicitly.
 """
 

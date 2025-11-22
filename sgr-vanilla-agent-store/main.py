@@ -1,16 +1,20 @@
 import textwrap
+from dotenv import load_dotenv
 from openai import OpenAI
-from store_agent import run_agent
+
 from erc3 import ERC3
+
+load_dotenv()
+from store_agent import run_agent
 
 client = OpenAI()
 core = ERC3()
-MODEL_ID = "gpt-4o"
+MODEL_ID = "gpt-4.1-mini"
 
 # Start session with metadata
 res = core.start_session(
     benchmark="store",
-    workspace="my",
+    workspace="ira",
     name="Simple SGR Agent",
     architecture="NextStep SGR Agent with OpenAI")
 
@@ -32,7 +36,6 @@ for task in status.tasks:
         print(f"\nSCORE: {result.eval.score}\n{explain}\n")
 
 core.submit_session(res.session_id)
-
 
 
 
