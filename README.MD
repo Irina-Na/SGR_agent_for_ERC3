@@ -1,74 +1,49 @@
-# ERC3 Sample Agents
+# ERC3 Store Agents
 
-Sample agents demonstrating how to participate in the ERC3: AI Agents in Action competition.
+Два готовых агента для бенчмарка ERC3 "store": простой SGR‑агент (NextStep от https://github.com/trustbit/erc3-agents) и версия с памятью, экстракцией знаний и агентом кодировщиком от smolagents.
 
-## Getting Started
+## Что внутри
+- `sgr-vanilla-agent-store` — минимальный Schema-Guided Reasoning цикл с OpenAI (`gpt-4.1-mini` по умолчанию).
+- `sgr-knowledge-agent-store` — расширенный агент: формулирует критерии успеха, ведет сжатую память, умеет прогонять код через smolagents, работает как с OpenAI, так и с Nebius (`gpt-5.1` по умолчанию).
+- `/res` — консольные скриншоты результата.
 
-### 1. Get Your API Key
+## Требования
+- Python 3.10+ и `pip`.
+- Аккаунт в ERC3 и `ERC3_API_KEY`.
+- Ключ для LLM: `OPENAI_API_KEY` (для обоих), опционально `NEBIUS_API_KEY` и `NEBIUS_API_BASE` (для Nebius, базовый URL уже зашит).
 
-To use these agents, you'll need an ERC3 API key:
-
-1. Visit https://erc.timetoact-group.at/
-2. Enter the email address you used during registration
-3. Your API key will be displayed
-
-Note: If you haven't registered yet, https://www.timetoact-group.at/events/enterprise-rag-challenge-part-3 and allow 24 hours for your
-registration to be processed.
-
-### 2. Prerequisites
-
-All agents require:
-- ERC3 SDK - for connecting to the platform and accessing benchmarks
-- ERC3_API_KEY - your competition API key
-- LLM API Key - such as OPENAI_API_KEY or equivalent (depending on the agent)
-
-## Running an Agent
-
-Here's an example of running the sgr-agent-store (a simple agent that solves the store benchmark):
-
+Пример `.env` в корне:
 ```
-# Set up your environment variables
-export OPENAI_API_KEY=sk-...
-export ERC3_API_KEY=key-...
+ERC3_API_KEY=key-...
+OPENAI_API_KEY=sk-...
+NEBIUS_API_KEY=nb-...          # нужно только knowledge-агенту
+# NEBIUS_API_BASE=https://api.studio.nebius.com/v1/  # если хотите переопределить
+```
 
-# Navigate to the agent directory
-cd sgr-agent-store
+## Быстрый старт
+1) Клонируйте репозиторий и при желании создайте виртуальное окружение.  
+2) Положите `.env` в корень (ключи подтягиваются из него).  
+3) Установите зависимости конкретного агента и запустите его.
 
-# Activate your virtual environment (optional but recommended)
-# python3 -m venv venv
-# source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+### Запуск простого агента (`sgr-vanilla-agent-store`)
+```
+cd sgr-vanilla-agent-store
 pip install -r requirements.txt
-
-# Run the agent
-python3 main.py
+python main.py
 ```
+Настройте модель и метаданные сессии в `sgr-vanilla-agent-store/main.py` (поля `MODEL_ID`, `workspace`, `name`).
 
-this should look like this:
+### Запуск агента с памятью и смолкодом (`sgr-knowledge-agent-store`)
+```
+cd sgr-knowledge-agent-store
+pip install -r requirements.txt
+python main.py
+```
+По умолчанию `main.py` использует OpenAI. Поменяйте параметр `provider` в вызове `run_agent` на `"nebius"`, если хотите работать через Nebius (требуется `NEBIUS_API_KEY`).
 
-![res/console.png](res/console.png)
+## Полезно знать
+- Агент сам стартует/завершает задачи через `ERC3` SDK; после выполнения сессия отправляется `submit_session`.
+- Снимки консоли лежат в `res/console.png`; UI сессии — на https://erc.timetoact-group.at/.
 
-you can also go to the [Web UI]() and view your running session there:
-
-![res/session.png](res/session.png)
-
-Task execution view allows to see interactions of agent with the Benchmark in more detail:
-
-![res/log.png](res/log.png)
-
-
-
-# Available Agents
-
-- sgr-agent-store - A simple agent implementation for the store benchmark. It relies on [Schema-Guided Reasoning](https://abdullin.com/schema-guided-reasoning/) to provide adaptive thinking capabilities with a single recursive prompt and gpt-4o.
-
-# Resources
-
-- https://www.timetoact-group.at/events/enterprise-rag-challenge-part-3
-- https://erc.timetoact-group.at/
-
-# Support
-
-You can ask questions in the discord channel (you get a link to that with the registration email)
-
+## Поддержка
+Вопросы по соревнованию — в Discord, ссылка приходит в письме после регистрации на ERC3.

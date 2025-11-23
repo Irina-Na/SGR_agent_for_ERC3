@@ -2,3 +2,5 @@
 erc3>=1.0.4
 openai>=2.8.1
 python-dotenv>=1.0.1
+smolagents>=1.23.0
+pydantic>=2.12.4
