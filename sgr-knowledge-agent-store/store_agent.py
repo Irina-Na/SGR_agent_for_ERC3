@@ -96,7 +96,7 @@ def run_agent(
         print(f" - {cond}")
 
     # 2. Store Warehouse (API Schema + Data)
-    store_warehouse = fetch_available_products_list(store_api)
+    store_warehouse, current_view_basket = fetch_available_products_list(store_api)
     print(f"[Store Warehouse]:\n{('\n'.join([str(p) for p in store_warehouse]))}\n")
     
     # 3. Build System Prompt
@@ -108,8 +108,8 @@ def run_agent(
     )
 
     # 4. Knowledge accumulator - carries forward between iterations
-    accumulated_knowledge = []
-    
+    accumulated_knowledge = [f'basket_state: {current_view_basket}']
+        
     # 5. Base log (system + initial request)
     base_log = [
         {"role": "system", "content": system_prompt},
@@ -117,8 +117,8 @@ def run_agent(
             "role": "user",
             "content": (
                 f"ORIGINAL REQUEST:\n{task.task_text}\n\n"
-                "Begin execution. Verify the state of the store first."
-                f"KNOWLEDGE ACCUMULATION: {'\\n'.join([str(item) for item in accumulated_knowledge])}"
+                f"PREVIOUS STEPS: {'\\n'.join([str(item) for item in accumulated_knowledge])}\n\n"
+                f"CRITERIA:\n{checklist_str}"
             ),
         },
     ]
@@ -144,13 +144,19 @@ def run_agent(
         current_log = base_log.copy()
         current_log = current_log + log
         
-        langfuse.update_current_trace(name=run_name)
+        
+        langfuse.update_current_trace(name=task.spec_id)
+        # Log the current conversation context for observability
+        langfuse.update_current_span(input={"messages": current_log})
+
+
         completion = client.beta.chat.completions.parse(
             model=model_id,
             messages=current_log,
             response_format=NextMove,
         )
         
+        langfuse.update_current_span(output=completion)
         # ---- FAILURE DETECTION & RETRY ----
         raw_content = completion.choices[0].message.content or ""
         if "CRITICAL FAILURE" in raw_content.upper():

@@ -5,7 +5,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
 from erc3 import store
-
+from langfuse import observe
 from data_models import CheckCoupon, SuccessCriteria
 from prompts import CRITERIA_SYSTEM_PROMPT
 
@@ -48,7 +48,7 @@ def get_llm_client(provider: Literal["nebius", "openai"]) -> OpenAI:
 def fetch_available_products_list(
     store_api,
     page_size: Optional[int] = None,
-) -> pd.DataFrame:
+) -> tuple[List[dict], dict]:    
     """
     Fetch all products via Req_ListProducts using a single store client and
     return only items that are in stock as a pandas DataFrame.
@@ -83,7 +83,9 @@ def fetch_available_products_list(
         limit = len(response.products)
         offset += limit
 
-    return products
+    basket_state = store_api.dispatch(store.Req_ViewBasket())
+
+    return products, basket_state
 
 
 def get_api_call(store_api, tool_obj):
@@ -144,7 +146,7 @@ def check_coupon(store_api, payload: CheckCoupon):
 
     return response
 
-
+@observe()
 def get_criteria(
     model_id: str,
     task_text: str,

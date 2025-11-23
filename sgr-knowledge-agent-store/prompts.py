@@ -101,6 +101,6 @@ To find the best price, to compare discounts, you must manually test coupons one
 1. **Verify**: Check the status of EVERY Success Criteria above.
 2. **Decide**:
    - If ANY Criteria is impossible to achieve -> Choose `ImpossibleToAchive`
-   - If ANY Criteria is "Not Met" -> Choose `PerformAction`.
    - If ALL Criteria are "Met" and you check it by Req_CheckoutBasket -> Choose `FinishTask`.
+   - If ANY Criteria is "Not Met" -> Choose `PerformAction`.
 """.strip()
