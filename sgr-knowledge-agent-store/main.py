@@ -6,7 +6,7 @@ from erc3 import ERC3
 # Initialize ERC3 Core
 core = ERC3()
 
-
+platform = "openai"  # "nebius" #"openai"
 MODEL_ID = "gpt-4.1"
 CRITERIA_MODEL_ID = "gpt-5.1"
 
@@ -15,7 +15,7 @@ def main():
     res = core.start_session(
         benchmark="store",
         workspace="ira",
-        name=f"nebius {MODEL_ID} {CRITERIA_MODEL_ID} + store parser",
+        name=f"{platform} {MODEL_ID} {CRITERIA_MODEL_ID} + store parser + remove old steps",
         architecture="SGR Agent + code agent + Added data about API + store parser",
     )
 
@@ -36,7 +36,7 @@ def main():
         
         try:
   
-            run_agent(MODEL_ID, CRITERIA_MODEL_ID, core, task , provider="openai")
+            run_agent(MODEL_ID, CRITERIA_MODEL_ID, core, task , provider=platform)
         except Exception as e:
             print(f"CRITICAL FAILURE: {e}")
             # Optional: Fail the task explicitly if needed, 
