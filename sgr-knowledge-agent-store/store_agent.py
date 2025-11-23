@@ -50,7 +50,6 @@ def run_agent(
     api: ERC3,
     task: TaskInfo,
     provider: Literal["nebius", "openai"] = "nebius",
-    run_name: str | None = None,
 ):
     """
     Run the store agent loop.
@@ -96,7 +95,7 @@ def run_agent(
         print(f" - {cond}")
 
     # 2. Store Warehouse (API Schema + Data)
-    store_warehouse = fetch_available_products_list(store_api)
+    store_warehouse, current_view_basket = fetch_available_products_list(store_api)
     print(f"[Store Warehouse]:\n{('\n'.join([str(p) for p in store_warehouse]))}\n")
     
     # 3. Build System Prompt
@@ -108,7 +107,7 @@ def run_agent(
     )
 
     # 4. Knowledge accumulator - carries forward between iterations
-    accumulated_knowledge = []
+    accumulated_knowledge = [f'basket_state: {current_view_basket}']
     
     # 5. Base log (system + initial request)
     base_log = [
@@ -117,8 +116,8 @@ def run_agent(
             "role": "user",
             "content": (
                 f"ORIGINAL REQUEST:\n{task.task_text}\n\n"
-                "Begin execution. Verify the state of the store first."
-                f"KNOWLEDGE ACCUMULATION: {'\\n'.join([str(item) for item in accumulated_knowledge])}"
+                f"PREVIOUS STEPS: {'\\n'.join([str(item) for item in accumulated_knowledge])}\n\n"
+                f"CRITERIA:\n{checklist_str}\n"
             ),
         },
     ]
@@ -144,13 +143,16 @@ def run_agent(
         current_log = base_log.copy()
         current_log = current_log + log
         
-        langfuse.update_current_trace(name=run_name)
+        langfuse.update_current_trace(name=task.spec_id)
+        # Log the current conversation context for observability
+        langfuse.update_current_span(input={"messages": current_log})
+        
         completion = client.beta.chat.completions.parse(
             model=model_id,
             messages=current_log,
             response_format=NextMove,
         )
-        
+        langfuse.update_current_span(output=completion)
         # ---- FAILURE DETECTION & RETRY ----
         raw_content = completion.choices[0].message.content or ""
         if "CRITICAL FAILURE" in raw_content.upper():
@@ -227,15 +229,31 @@ def run_agent(
 
         # Execute
         tool_output = ""
+        success = False
         try:
             if isinstance(tool_obj, Req_AnalyzeWithCode):
                 print(f"  {CLI_BLUE}>> CodeAgent: {tool_obj.query}{CLI_CLR}")
                 res = code_agent.run(tool_obj.query)
                 tool_output = f"Analysis: {res}"
                 print(f"  {CLI_GREEN}<< Code OK{CLI_CLR}")
+                success = True
             else:
-                tool_output = get_api_call(store_api, tool_obj)
-                print(f"[Tool Output]: {tool_output}")
+                should_view_basket = isinstance(
+                    tool_obj,
+                    (
+                        store.Req_ApplyCoupon,
+                        store.Req_RemoveCoupon,
+                        store.Req_AddProductToBasket,
+                        store.Req_RemoveItemFromBasket,
+                    ),
+                )
+                tool_output, success = get_api_call(store_api, tool_obj)
+
+                if success and should_view_basket:
+                    basket_output, _ = get_api_call(
+                        store_api, store.Req_ViewBasket()
+                    )
+                    tool_output = basket_output
                 
         except Exception as e:
             tool_output = f"Error: {str(e)}"

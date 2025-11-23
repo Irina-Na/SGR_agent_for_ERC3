@@ -15,8 +15,8 @@ def main():
     res = core.start_session(
         benchmark="store",
         workspace="ira",
-        name=f"{platform} {MODEL_ID} {CRITERIA_MODEL_ID} + parser + ref knowledge",
-        architecture="SGR Agent + code agent + Added data about API + store parser",
+        name=f"{MODEL_ID} {CRITERIA_MODEL_ID} + join_bucket_view_criteria_up + parser + knowledge",
+        architecture="SGR Agent + code agent + Added data about API + Join API calls with bucket view + store parser + knowledge collection puts forward",
     )
 
     print(f"Session ID: {res.session_id}")
@@ -36,7 +36,7 @@ def main():
         
         try:
   
-            run_agent(MODEL_ID, CRITERIA_MODEL_ID, core, task , provider=platform, run_name=task.spec_id,)
+            run_agent(MODEL_ID, CRITERIA_MODEL_ID, core, task , provider=platform,)
         except Exception as e:
             print(f"CRITICAL FAILURE: {e}")
             # Optional: Fail the task explicitly if needed, 
