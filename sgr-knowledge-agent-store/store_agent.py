@@ -1,10 +1,10 @@
 import time
 import json
 from typing import Annotated, List, Union, Literal, Optional
-from annotated_types import MaxLen, MinLen
 from pydantic import BaseModel, Field
 import time
 import os
+import pandas as pd
 from erc3 import store, ApiException, TaskInfo, ERC3
 
 # AI Imports
@@ -50,17 +50,65 @@ def get_llm_client(provider: Literal["nebius", "openai"]) -> OpenAI:
     raise ValueError(f"Unknown provider: {provider}")
 
 
+def fetch_available_products_list(
+    store_api,
+    page_size: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Fetch all products via Req_ListProducts using a single store client and
+    return only items that are in stock as a pandas DataFrame.
+
+    - If page_size is None (default), uses limit=0 to ask the API for the
+      maximum allowed page in one call.
+    - If page_size is set, paginates using next_offset and the provided limit
+      to avoid exceeding API limits.
+    """
+    products: List[dict] = []
+
+    limit = 0 if page_size is None else page_size
+    offset = 0
+
+    while True:
+        response = store_api.dispatch(
+            store.Req_ListProducts(limit=limit, offset=offset)
+        )
+
+        for p in response.products:
+            if p.available and p.available > 0:
+                products.append(
+                    {
+                        "sku": p.sku,
+                        "name": p.name,
+                        "price": p.price,
+                        "available": p.available,
+                    }
+                )
+        if response.next_offset <= 0:
+            break
+        limit = len(response.products)
+        offset += limit
+
+    return products
+
 # ==========================================
 # 2. DATA MODELS
 # ==========================================
 
-class InitialPlan(BaseModel):
-    core_goal: str
+class SuccessCriteria(BaseModel):
     success_criteria: List[str] = Field(
         ...,
         description="List of state assertions (e.g., 'Item X is in basket')."
     )
-
+    conditions_for_achieving_the_goal: List[str] = Field(
+        ...,
+        description="What conditions must be met for achieving the goal?"
+    )
+    
+class ImpossibleToAchive(BaseModel):
+    """Select this if any criteria is impossible to achieve."""
+    action_type: Literal["impossible_to_achieve"]
+    reason: str = Field(..., description="Short explanation")
+    
 class CriterionState(BaseModel):
     requirement: str
     status: Literal["Met", "Not Met"]
@@ -73,7 +121,6 @@ class PerformAction(BaseModel):
     """Select this to execute a store tool or code analysis."""
     action_type: Literal["execute_tool"]
     tool: Union[
-        store.Req_ListProducts,
         store.Req_ViewBasket,
         store.Req_ApplyCoupon,
         store.Req_RemoveCoupon,
@@ -86,23 +133,19 @@ class PerformAction(BaseModel):
 class FinishTask(BaseModel):
     """Select this ONLY if ALL success criteria are 'Met'."""
     action_type: Literal["finish_task"]
-    final_summary: str
-    code: Literal["completed", "failed"]
+
 
 class NextMove(BaseModel):
-    knowledge_summary: str = Field(
+    knowledges: List[str] = Field(
         ...,
         description=(
-            "A summary of IMPORTANT facts gathered so far. "
+            "Save all IMPORTANT facts gathered throughout the entire process of solving the problem."
             "E.g., '6pk is $4, 24pk is $18. Coupon SAVE10 is active.'"
         )
     )
     state_assessment: List[CriterionState]
-    thought_process: str
-    decision: Union[PerformAction, FinishTask] = Field(
-        ...,
-        description="Do you need to perform an action or are you finished?"
-    )
+    thought_process: Optional[str] = Field(None, description=("Very short" ))
+    decision: Union[PerformAction, FinishTask, ImpossibleToAchive]
 
 
 # ==========================================
@@ -115,12 +158,22 @@ CLI_BLUE = "\x1B[34m"
 CLI_YELLOW = "\x1B[33m"
 CLI_CLR = "\x1B[0m"
 
+def get_api_call(store_api, tool_obj):
+    try:
+        res = store_api.dispatch(tool_obj)
+        tool_output = res.model_dump_json(exclude_none=True, exclude_unset=True)
+        print(f"\n [Tool Output]: {tool_output}")
+        print(f"  {CLI_GREEN}<< API OK{CLI_CLR}")
+        return tool_output
+    except Exception as e:
+        print(f"{CLI_RED}Checkout failed: {e}{CLI_CLR}")
+
 
 def get_criteria(
     model_id: str,
     task_text: str,
     provider: Literal["nebius", "openai"] = "nebius",
-) -> InitialPlan:
+) -> SuccessCriteria:
     """Phase 1: use chosen provider/model to extract success criteria."""
     print(f"{CLI_YELLOW}Phase 1: Defining Success State... (provider={provider}, model={model_id}){CLI_CLR}")
     client = get_llm_client(provider)
@@ -130,22 +183,22 @@ def get_criteria(
         messages=[
             {
                 "role": "system",
-                "content": '''
-Extract only the core state conditions that must be true when the task is successfully completed.
-List no more than 3 conditions.
+                "content": '''this is task for online shop assistant. Online shop with a product catalogue, discounts and basket. 
+Extract only the core state conditions that must be true when the task is successfully completed.   
 Use only information explicitly stated in the request — do not infer or introduce new requirements.
 Do not describe actions, only the final verifiable state.
                 '''.strip(),
             },
             {"role": "user", "content": task_text},
         ],
-        response_format=InitialPlan,
+        response_format=SuccessCriteria,
     )
     return completion.choices[0].message.parsed
 
 
 def run_agent(
     model_id: str,
+    get_criteria_model_id: str,
     api: ERC3,
     task: TaskInfo,
     provider: Literal["nebius", "openai"] = "nebius",
@@ -159,6 +212,8 @@ def run_agent(
     client = get_llm_client(provider)
     store_api = api.get_store_client(task)
 
+    store_warehouse = fetch_available_products_list(store_api)
+    
     # ---- Model for smolagents CodeAgent ----
     if provider == "nebius":
         smol_model = OpenAIServerModel(
@@ -181,52 +236,103 @@ def run_agent(
     )
 
     # 1. Plan
-    plan = get_criteria(model_id, task.task_text, provider=provider)
+    plan = get_criteria(get_criteria_model_id, task.task_text, provider=provider)
     checklist_str = "\n".join([f"- {c}" for c in plan.success_criteria])
-    print(f"Goal: {plan.core_goal}")
-    print(f"Assertions:\n{checklist_str}\n")
+
+    print(f"Criteria:\n{checklist_str}\n")
+    print("Conditions for achieving the goal:")
+    for cond in plan.conditions_for_achieving_the_goal:
+        print(f" - {cond}")
 
     system_prompt = f"""
 You are a Store Agent.
 
-**Goal**: {plan.core_goal}
-**Assertions**:
-{checklist_str}
+**TASK**: 
+    {task.task_text}
+**Success Criteria**: 
+    {checklist_str}
+**Achievability**:
+    {plan.conditions_for_achieving_the_goal}
 
-**TOOL USAGE GUIDE (Read Carefully)**:
-1. `Req_ListProducts`: Use to find items, check prices, and see inventory.
-2. `Req_AddProductToBasket`: Use ONLY for adding physical products. **NEVER use this for coupons.**
-3. `Req_RemoveItemFromBasket`: Use to remove product from basket.
-4. `Req_ApplyCoupon`: Use ONLY for applying discount codes (e.g. "SAVE10", "FIT20").
-5. `Req_RemoveCoupon`: Use to remove coupon.
-6. `Req_ViewBasket`: Use to check if items are added and if coupons are active.
-7. `Req_CheckoutBasket`: Use only at the very end to finalize the purchase. You can purchase only ONCE! So make it count.
-8. `Req_AnalyzeWithCode`: Use for optimisations. **IMPORTANT**: You CANNOT ask code to compare coupons if you do not know what they do.
+**Products**: 
+    "sku" - id for adding to the basket
+    "name" - market name
+    "available" - quantity in stock. but Always re-check product availability in `Req_CheckoutBasket` before finishing the task.
+    "price" - price for 1 unit in USD
+    {str(store_warehouse)}
+    
+
+**API -TOOL USAGE GUIDE (Read Carefully)**:
+
+1. `Req_AddProductToBasket`:  for adding physical products to basket.
+    Input:  
+    "quantity" - how much to add to the basket
+    "sku" - id from `Req_ListProducts`
+    Output:
+    To check the final availability, use `Req_CheckoutBasket`.
+
+2. `Req_RemoveItemFromBasket`: to remove product from basket.
+    Input:  
+    "quantity" - how much to remove from the basket
+    "sku" - id
+    Output:
+    To check the final availability, use `Req_CheckoutBasket`.
+
+3. `Req_ApplyCoupon`: to apply discount codes (e.g. "SAVE10", "FIT20") for all sku in basket.
+    Input:  
+    "coupon" - name of coupon
+    Output:
+    empty response. To check the effect, use `Req_ViewBasket`.
+
+4. `Req_RemoveCoupon`: to remove one coupon for all sku in basket.
+    Input:  
+    "coupon" - name of coupon
+    Output:
+    empty response. To check the effect, use `Req_ViewBasket`.
+
+5. `Req_ViewBasket`: to check what coupons are applied and their effects.
+    Input:  
+    empty.
+    Output:
+    "items": [
+        "price" - price per unit,
+        "quantity" - how many units,
+        "sku" - product id,
+            ],
+    "subtotal" - before discount,
+    "coupon" - Optional, name of active coupon
+    "total" - after discount,
+    "discount" - Optional - total discount in USD. Exist only if coupon realy gives discount.
+
+6. `Req_CheckoutBasket` - to finalize the purchase and re-check product availability in real-time.
+    Input:
+    empty.
+
+7. `Req_AnalyzeWithCode`: use for any calculations. **IMPORTANT**: You CANNOT ask code to compare coupons if you do not know what they do.
 
 **COUPON DISCOVERY PROTOCOL**:
+Some coupouns may work with bundles. Take into account coupon names.
+Best way to gather info about possible product combos for coupons - add product types in question to basket, apply coupons and look how prices change. One coupon may change price of product combination.
+Only one coupon can be applied at a time. Apply a new coupon to replace the current one, or remove it explicitly.
+If you want to compare discounts, first you will have to collect information about product prices with applied coupons.
+
 To find the best price, you must manually test coupons one by one to see their effect:
 1. Add items to basket.
-2. `Req_ApplyCoupon` (Coupon A) -> `Req_ViewBasket` -> Record Total.
-3. `Req_ApplyCoupon` (Coupon B) -> `Req_ViewBasket` -> Record Total.
+2. `Req_ApplyCoupon` (Coupon A) -> `Req_ViewBasket` -> Record as Knowledge.
+3. `Req_ApplyCoupon` (Coupon B) -> `Req_ViewBasket` -> Record as Knowledge.
 4. Once you have the DATA (e.g., "Coupon A is 10% off, Coupon B is $5 off"), THEN decide.
 
 **Protocol**:
-1. **Verify**: Check the status of EVERY assertion above.
+1. **Verify**: Check the status of EVERY Success Criteria above.
 2. **Decide**:
-   - If ANY assertion is "Not Met" -> Choose `PerformAction`.
-   - If ANY assertion is impossible to achieve based on new data -> Choose `FinishTask`
-   - If ALL assertions are "Met" -> Choose `FinishTask`.
-
-**Store hints**:
-- If ListProducts returns non-zero "NextOffset", it means there are more products available.
-- You can apply coupon codes using `Req_ApplyCoupon` to get discounts.
-- Some coupouns may work with bundles. Take into account coupon names.
-- Best way to gather info about possible product combos for coupons - add product types in question to basket, apply coupons and look how prices change. One coupon may change price of product combination.
-- Use ViewBasket to see current discount and total.
-- Only one coupon can be applied at a time. Apply a new coupon to replace the current one, or remove it explicitly.
-- If you want to compare discounts, first you will have to collect information about product prices with applied coupons.
+   - If ANY Criteria is impossible to achieve -> Choose `ImpossibleToAchive`
+   - If ANY Criteria is "Not Met" -> Choose `PerformAction`.
+   - If ALL Criteria are "Met" and you check it by Req_CheckoutBasket -> Choose `FinishTask`.
 """.strip()
 
+    # Knowledge accumulator - carries forward between iterations
+    accumulated_knowledge = ""
+    
     # Base log (system + initial request)
     base_log = [
         {"role": "system", "content": system_prompt},
@@ -235,6 +341,7 @@ To find the best price, you must manually test coupons one by one to see their e
             "content": (
                 f"ORIGINAL REQUEST:\n{task.task_text}\n\n"
                 "Begin execution. Verify the state of the store first."
+                f"KNOWLEDGE ACCUMULATION: {"\n".join(accumulated_knowledge)}"
             ),
         },
     ]
@@ -244,40 +351,29 @@ To find the best price, you must manually test coupons one by one to see their e
         tuple[dict, dict]
     ] = []  # List of (assistant_msg, tool_output) tuples
 
-    # Knowledge accumulator - carries forward between iterations
-    accumulated_knowledge = ""
+    # Build current context: base + knowledge summary + recent window
 
-    for i in range(30):
+    log = []
+    for i in range(15):
 
         step_label = f"Step {i+1}"
         print(f"{step_label}: Thinking...", end=" ")
         started = time.time()
-
-        # Build current context: base + knowledge summary + recent window
-        current_log = base_log.copy()
-
-        # Inject accumulated knowledge before recent interactions
-        if accumulated_knowledge:
-            current_log.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "ACCUMULATED KNOWLEDGE FROM PREVIOUS STEPS:\n"
-                        f"{accumulated_knowledge}"
-                    ),
-                }
-            )
-
+            
         for assistant_msg, tool_output in recent_interactions:
-            current_log.append(assistant_msg)
-            current_log.append(tool_output)
+            log.append(assistant_msg)
+            log.append(tool_output)
+        
+        current_log = base_log.copy()
+        current_log = current_log + log
 
         completion = client.beta.chat.completions.parse(
             model=model_id,
             messages=current_log,
             response_format=NextMove,
         )
-                # ---- FAILURE DETECTION & RETRY ----
+        
+        # ---- FAILURE DETECTION & RETRY ----
         raw_content = completion.choices[0].message.content or ""
         if "CRITICAL FAILURE" in raw_content.upper():
             print(f"{CLI_RED}!! MODEL FAILURE DETECTED → waiting 10 seconds and retrying...{CLI_CLR}")
@@ -287,7 +383,7 @@ To find the best price, you must manually test coupons one by one to see their e
         # Log with provider prefix
         api.log_llm(
             task_id=task.task_id,
-            model=f"{provider}/{model_id}",
+            model=f"{provider}/{model_id}", # todo: add criteria model?
             duration_sec=time.time() - started,
             usage=completion.usage,
         )
@@ -295,31 +391,33 @@ To find the best price, you must manually test coupons one by one to see their e
         move = completion.choices[0].message.parsed
 
         # Update accumulated knowledge from this turn
-        accumulated_knowledge = move.knowledge_summary
+        accumulated_knowledge = move.knowledges
 
         # Log Decision Type
         met_count = sum(1 for c in move.state_assessment if c.status == "Met")
         decision_type = "Action" if isinstance(move.decision, PerformAction) else "Finish"
 
-        print(f"\n[Knowledge]: {move.knowledge_summary}")
+        print(f"\n[Knowledge]: {accumulated_knowledge}")
         print(f"[State]: {met_count}/{len(move.state_assessment)} Met -> {decision_type}")
+        print(f" {move.state_assessment}")
         print(f"[Thought]: {move.thought_process}")
 
         # --- COMPLETION HANDLER ---
+        if isinstance(move.decision, ImpossibleToAchive):
+            print(f"{CLI_RED}Task impossible to achieve: {move.decision.reason}{CLI_CLR}")
+            
+            break
+            
         if isinstance(move.decision, FinishTask):
             unmet = [c.requirement for c in move.state_assessment if c.status == "Not Met"]
 
             # Guardrail: Anti-Hallucination
-            if move.decision.code == "completed" and unmet:
+            if unmet:
                 print(f"{CLI_RED}GUARDRAIL: Rejected. Unmet: {unmet[0]}...{CLI_CLR}")
 
                 # Generate a specific hint
                 hint = "You must continue working."
-                if "inventory" in unmet[0].lower() or "identified" in unmet[0].lower():
-                    hint = "Call `Req_ListProducts` to verify inventory."
-                elif "added" in unmet[0].lower() or "basket" in unmet[0].lower():
-                    hint = "Call `Req_AddProductToBasket`."
-
+                
                 # Add to sliding window
                 assistant_msg = {
                     "role": "assistant",
@@ -338,7 +436,10 @@ To find the best price, you must manually test coupons one by one to see their e
 
                 continue
 
-            print(f"{CLI_BLUE}Finished: {move.decision.code}{CLI_CLR}")
+            # Complete the task
+            get_api_call(store_api, store.Req_CheckoutBasket())
+
+            print(f"{CLI_BLUE}Finished: {move.decision}{CLI_CLR}")
             break
 
         # --- ACTION HANDLER ---
@@ -357,10 +458,9 @@ To find the best price, you must manually test coupons one by one to see their e
                 tool_output = f"Analysis: {res}"
                 print(f"  {CLI_GREEN}<< Code OK{CLI_CLR}")
             else:
-                res = store_api.dispatch(tool_obj)
-                tool_output = res.model_dump_json(exclude_none=True, exclude_unset=True)
-                print(f"  {CLI_GREEN}<< API OK{CLI_CLR}")
-
+                tool_output = get_api_call(store_api, tool_obj)
+                print(f"[Tool Output]: {tool_output}")
+                
         except Exception as e:
             tool_output = f"Error: {str(e)}"
             print(f"  {CLI_RED}<< {tool_output}{CLI_CLR}")
