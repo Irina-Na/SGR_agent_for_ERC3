@@ -136,18 +136,18 @@ class FinishTask(BaseModel):
 
     
 class KnowledgeItem(BaseModel):
-    fact: str = Field(..., description="An important fact learned during the task. E.g., '6pk is $4, 24pk is $18. Coupon SAVE10 is active.'")
+    fact_or_move_and_result: str = Field(..., description="An important fact learned during the task execution and API call. E.g., '4×6pk: $4 off (SAVE10); 24pk: $18 off (FIT20).'")
   
 class NextMove(BaseModel):
     knowledges: List[KnowledgeItem] = Field(
         ...,
         description=(
-            "Save all IMPORTANT facts gathered throughout the entire process of solving the problem. Delete or re-write outdated or refuted facts. "
+            "Save all useful facts gathered throughout the last step."
         )
     )
     state_assessment: List[CriterionState]
     thought_process: Optional[str] = Field(None, description=("Very short" ))
-    decision: Union[PerformAction, FinishTask, ImpossibleToAchive]
+    decision: Union[PerformAction, ImpossibleToAchive, FinishTask]
 
 
 # ==========================================
@@ -188,7 +188,7 @@ def get_criteria(
             messages=[
                 {
                     "role": "system",
-                    "content": '''this is task for online shop assistant. Online shop with a product catalogue, discounts and basket. 
+                    "content": '''this is task for online shop assistant. Online shop with a product catalogue, discounts by coupons and basket. 
     Extract only the core state conditions that must be true when the task is successfully completed.   
     Use only information explicitly stated in the request — do not infer or introduce new requirements.
     Do not describe actions, only the final verifiable state.
@@ -313,19 +313,18 @@ You are a Online Store Assistant.
     Input:
     empty.
 
-7. `Req_AnalyzeWithCode`: use for any calculations. **IMPORTANT**: You CANNOT ask code to compare coupons if you do not know what they do.
+7. `Req_AnalyzeWithCode`: - to find the min, max, sum and all other statistics and calculations. 
 
 **COUPON DISCOVERY PROTOCOL**:
-Take into account coupon names. Only one coupon can be applied at a time. One coupon may change price of product combination.
-Some coupons may work only for bundles of products.
-Best way to gather info about possible product combos for coupons is to add suggested products from **TASK** to basket, apply coupons and look how prices change.
-If the discount field does not appear after applying coupon - not all conditions of the coupon are met.
+Take into account coupon names. Only one coupon can be applied at a time. One coupon may change price of product combination (remember the combination).
+Some coupons may work only for bundles of products. 
+If the discount field does not appear after applying coupon - not all required items are added.
+Sometimes adding extra items can be beneficial if it activates a coupon discount.
 However, if you add products specified in the **TASK**, the total price may fall down then without this items.
 Apply a new coupon to replace the current one.
-If you want to compare discounts, first you will have to collect information about product prices with applied coupons.
 
-To find the best price, you must manually test coupons one by one to see their effect:
-1. Add items to basket.
+To find the best price, to compare discounts, you must manually test coupons one by one to see their effect:
+1. Add required items to basket.
 2. `Req_ApplyCoupon` (Coupon A) -> `Req_ViewBasket` -> Record as Knowledge.
 3. `Req_ApplyCoupon` (Coupon B) -> `Req_ViewBasket` -> Record as Knowledge.
 4. Once you have the DATA (e.g., "Coupon A is 10% off, Coupon B is $5 off"), THEN decide.
@@ -345,7 +344,7 @@ To find the best price, you must manually test coupons one by one to see their e
 """.strip()
 
     # Knowledge accumulator - carries forward between iterations
-    accumulated_knowledge = ""
+    accumulated_knowledge = []
     
     # Base log (system + initial request)
     base_log = [
@@ -355,7 +354,7 @@ To find the best price, you must manually test coupons one by one to see their e
             "content": (
                 f"ORIGINAL REQUEST:\n{task.task_text}\n\n"
                 "Begin execution. Verify the state of the store first."
-                f"KNOWLEDGE ACCUMULATION: {"\n".join(accumulated_knowledge)}"
+                f"KNOWLEDGE ACCUMULATION: {"\n".join([str(item) for item in accumulated_knowledge])}"
             ),
         },
     ]
@@ -405,7 +404,7 @@ To find the best price, you must manually test coupons one by one to see their e
         move = completion.choices[0].message.parsed
 
         # Update accumulated knowledge from this turn
-        accumulated_knowledge = move.knowledges
+        accumulated_knowledge.append(move.knowledges)
 
         # Log Decision Type
         met_count = sum(1 for c in move.state_assessment if c.status == "Met")
