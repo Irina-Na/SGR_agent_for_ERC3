@@ -103,7 +103,7 @@ class SuccessCriteria(BaseModel):
         ...,
         description="What conditions must be met for achieving the goal?"
     )
-    
+  
 class ImpossibleToAchive(BaseModel):
     """Select this if any criteria is impossible to achieve."""
     action_type: Literal["impossible_to_achieve"]
@@ -134,13 +134,15 @@ class FinishTask(BaseModel):
     """Select this ONLY if ALL success criteria are 'Met'."""
     action_type: Literal["finish_task"]
 
-
+    
+class KnowledgeItem(BaseModel):
+    fact: str = Field(..., description="An important fact learned during the task. E.g., '6pk is $4, 24pk is $18. Coupon SAVE10 is active.'")
+  
 class NextMove(BaseModel):
-    knowledges: List[str] = Field(
+    knowledges: List[KnowledgeItem] = Field(
         ...,
         description=(
-            "Save all IMPORTANT facts gathered throughout the entire process of solving the problem."
-            "E.g., '6pk is $4, 24pk is $18. Coupon SAVE10 is active.'"
+            "Save all IMPORTANT facts gathered throughout the entire process of solving the problem. Delete or re-write outdated or refuted facts. "
         )
     )
     state_assessment: List[CriterionState]
@@ -316,8 +318,9 @@ You are a Online Store Assistant.
 **COUPON DISCOVERY PROTOCOL**:
 Take into account coupon names. Only one coupon can be applied at a time. One coupon may change price of product combination.
 Some coupons may work only for bundles of products.
-Best way to gather info about possible product combos for coupons - add product types from **TASK** to basket, apply coupons and look how prices change.
-If the combination does not fit conditions of the coupon, coupon will not work (the price after applying will be the same). However, if you add certain products specified in the **TASK**, the price may change.
+Best way to gather info about possible product combos for coupons is to add suggested products from **TASK** to basket, apply coupons and look how prices change.
+If the discount field does not appear after applying coupon - not all conditions of the coupon are met.
+However, if you add products specified in the **TASK**, the total price may fall down then without this items.
 Apply a new coupon to replace the current one.
 If you want to compare discounts, first you will have to collect information about product prices with applied coupons.
 

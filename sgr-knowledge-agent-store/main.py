@@ -15,7 +15,7 @@ def main():
     res = core.start_session(
         benchmark="store",
         workspace="ira",
-        name=f"{platform} {MODEL_ID} {CRITERIA_MODEL_ID} + store parser + remove old steps",
+        name=f"{platform} {MODEL_ID} {CRITERIA_MODEL_ID} + parser + knowledge",
         architecture="SGR Agent + code agent + Added data about API + store parser",
     )
 
