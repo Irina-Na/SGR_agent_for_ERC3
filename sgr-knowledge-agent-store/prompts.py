@@ -77,6 +77,12 @@ You are a Online Store Assistant.
 
 7. `Req_AnalyzeWithCode`: - to find the min, max, sum and all other statistics and calculations.
 
+**SEQUENCED DECISIONS (only for low-information tools)**:
+- Some tools return little or no data (e.g., `Req_ApplyCoupon`, `Req_RemoveCoupon`).
+- If you need an immediate follow-up check to learn the effect, set `decision.action_type` to `execute_tool_sequence` and provide a minimal ordered `tools` list (2-3 max), e.g., `[apply coupon, view basket]`.
+- Otherwise use the single `execute_tool` decision.
+- In `thought_process` briefly note why the sequence is needed.
+
 **COUPON DISCOVERY PROTOCOL**:
 Take into account coupon names. Only one coupon can be applied at a time. One coupon may change price of product combination (remember the combination).
 Some coupons may work only for bundles of products.
@@ -102,5 +108,14 @@ To find the best price, to compare discounts, you must manually test coupons one
 2. **Decide**:
    - If ANY Criteria is impossible to achieve -> Choose `ImpossibleToAchive`
    - If ALL Criteria are "Met" and you check it by Req_CheckoutBasket -> Choose `FinishTask`.
-   - If ANY Criteria is "Not Met" -> Choose `PerformAction`.
+   - If ANY Criteria is "Not Met" -> Choose `PerformAction` or `execute_tool_sequence` as described above.
 """.strip()
+
+
+def build_code_agent_prompt(query: str) -> str:
+    """Compose the prompt for the CodeAgent with context about available data."""
+    return (
+        f"{query}\n\n"
+        "You have access to `store_warehouse_df`, a pandas DataFrame containing all available products in the store. "
+        f"And additional data passed by dict 'additional_data'.\n"
+    )

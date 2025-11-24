@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import List, Optional, Literal
 
 import pandas as pd
@@ -15,8 +16,12 @@ CLI_BLUE = "\x1B[34m"
 CLI_YELLOW = "\x1B[33m"
 CLI_CLR = "\x1B[0m"
 
-# Load environment variables for API keys
-load_dotenv()
+# Load environment variables for API keys.
+# Ensure we always load the package-local .env (contains Langfuse keys) even if the
+# process is started from the repo root that has a different .env without Langfuse.
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR.parent / ".env")
+load_dotenv(BASE_DIR / ".env", override=False)
 
 # --- Nebius config ---
 NEBIUS_API_KEY = os.environ["NEBIUS_API_KEY"]
@@ -92,8 +97,9 @@ def get_api_call(store_api, tool_obj):
     try:
         res = store_api.dispatch(tool_obj)
         tool_output = res.model_dump_json(exclude_none=True, exclude_unset=True)
-        print(f"\n [Tool Output]: {tool_output}")
-        print(f"  {CLI_GREEN}<< API OK{CLI_CLR}")
+        print(f"\n  {CLI_GREEN}<< API OK{CLI_CLR}")
+        print(f"\n [Tool Output]: {tool_output}\n")
+
         return tool_output
     except Exception as e:
         err = f"Checkout failed: {e}"

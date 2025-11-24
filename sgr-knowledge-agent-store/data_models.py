@@ -1,6 +1,6 @@
 from typing import List, Union, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from erc3 import store
 
 
@@ -29,8 +29,13 @@ class CriterionState(BaseModel):
 
 
 class Req_AnalyzeWithCode(BaseModel):
-    query: str
+    model_config = ConfigDict(extra="forbid")
 
+    query: str = Field(..., description="Short calculation or statistics request.")
+    additional_data: Optional[str] = Field(
+        None,
+        description="Optional serialized data (stringified JSON) that may be useful for calculations, except store warehouse list.",
+    )
 
 class PerformAction(BaseModel):
     """Select this to execute a store tool or code analysis."""
@@ -45,6 +50,30 @@ class PerformAction(BaseModel):
         Req_AnalyzeWithCode,
         store.Req_CheckoutBasket,
     ] = Field(..., description="The specific tool to run.")
+
+
+class PerformActionSequence(BaseModel):
+    """Select this to execute a minimal ordered sequence of tools in one step."""
+
+    action_type: Literal["execute_tool_sequence"]
+    tools: List[
+        Union[
+            store.Req_ViewBasket,
+            store.Req_ApplyCoupon,
+            store.Req_RemoveCoupon,
+            store.Req_AddProductToBasket,
+            store.Req_RemoveItemFromBasket,
+            Req_AnalyzeWithCode,
+            store.Req_CheckoutBasket,
+        ]
+    ] = Field(
+        ...,
+        description=(
+            "Run these tools in order as one decision. "
+            "Use only when the earlier tool gives little or no immediate information "
+            "and must be paired with a follow-up check (e.g., apply coupon -> view basket)."
+        ),
+    )
 
 
 class FinishTask(BaseModel):
@@ -69,8 +98,14 @@ class NextMove(BaseModel):
         description=("Save all useful facts gathered throughout the last step."),
     )
     state_assessment: List[CriterionState]
-    thought_process: Optional[str] = Field(None, description=("Very short"))
-    decision: Union[PerformAction, ImpossibleToAchive, FinishTask]
+    thought_process: Optional[str] = Field(
+        None,
+        description=(
+            "Brief rationale (<2 sentences). Note when a minimal tool sequence is needed "
+            "because an earlier unary action gives no useful info (e.g., apply coupon -> view basket)."
+        ),
+    )
+    decision: Union[PerformAction, PerformActionSequence, ImpossibleToAchive, FinishTask]
 
 
 class BasketItem(BaseModel):

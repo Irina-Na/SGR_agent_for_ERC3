@@ -1,7 +1,7 @@
 import time
 import json
 from typing import List, Literal
-
+import pandas as pd
 from erc3 import store, TaskInfo, ERC3
 from data_models import (
     SuccessCriteria,
@@ -9,13 +9,14 @@ from data_models import (
     CriterionState,
     Req_AnalyzeWithCode,
     PerformAction,
+    PerformActionSequence,
     FinishTask,
     KnowledgeItem,
     NextMove,
     BasketItem,
     CheckCoupon,
 )
-from prompts import build_agent_system_prompt
+from prompts import build_agent_system_prompt, build_code_agent_prompt
 from tools import (
     fetch_available_products_list,
     get_api_call,
@@ -79,7 +80,7 @@ def run_agent(
     code_agent = CodeAgent(
         tools=[],
         model=smol_model,
-        additional_authorized_imports=["math", "datetime", "re"],
+        additional_authorized_imports=["math", "datetime", "re", "pandas"],
     )
 
     # 1. Plan
@@ -97,6 +98,7 @@ def run_agent(
 
     # 2. Store Warehouse (API Schema + Data)
     store_warehouse, current_view_basket = fetch_available_products_list(store_api)
+    store_warehouse_df = pd.DataFrame(store_warehouse)
     print(f"[Store Warehouse]:\n{('\n'.join([str(p) for p in store_warehouse]))}\n")
     
     # 3. Build System Prompt
@@ -181,10 +183,11 @@ def run_agent(
         met_count = sum(1 for c in move.state_assessment if c.status == "Met")
         decision_type = "Action" if isinstance(move.decision, PerformAction) else "Finish"
 
-        print(f"\n[Knowledge]: {accumulated_knowledge}")
+        print(f"\n[Knowledge]: {'\\n'.join([str(item) for item in accumulated_knowledge])}")
         print(f"[State]: {met_count}/{len(move.state_assessment)} Met -> {decision_type}")
-        print(f" {move.state_assessment}")
-        print(f"[Thought]: {move.thought_process}")
+        print(f" {move.state_assessment}\n")
+        print(f"[Thought]: {move.thought_process}\n")
+        print(f"[Decision]: {move.decision}\n")
 
         # --- COMPLETION HANDLER ---
         if isinstance(move.decision, ImpossibleToAchive):
@@ -193,7 +196,7 @@ def run_agent(
             break
             
         if isinstance(move.decision, FinishTask):
-            unmet = [c.requirement for c in move.state_assessment if c.status == "Not Met"]
+            unmet = [c.id for c in move.state_assessment if c.status == "Not Met"]
 
             # Guardrail: Anti-Hallucination
             if unmet:
@@ -226,26 +229,38 @@ def run_agent(
 
         # --- ACTION HANDLER ---
         action = move.decision
-        tool_obj = action.tool
-        tool_name = tool_obj.__class__.__name__
+        tools_to_run = (
+            action.tools if isinstance(action, PerformActionSequence) else [action.tool]
+        )
 
-        print(f"  >> Executing {tool_name}")
+        final_tool_output: str = ""
+        for idx, tool_obj in enumerate(tools_to_run, start=1):
+            tool_name = tool_obj.__class__.__name__
+            seq_suffix = f" ({idx}/{len(tools_to_run)})" if len(tools_to_run) > 1 else ""
+            print(f"  >> Executing {tool_name}{seq_suffix}")
 
-        # Execute
-        tool_output = ""
-        try:
-            if isinstance(tool_obj, Req_AnalyzeWithCode):
-                print(f"  {CLI_BLUE}>> CodeAgent: {tool_obj.query}{CLI_CLR}")
-                res = code_agent.run(tool_obj.query)
-                tool_output = f"Analysis: {res}"
-                print(f"  {CLI_GREEN}<< Code OK{CLI_CLR}")
-            else:
-                tool_output = get_api_call(store_api, tool_obj)
-                print(f"[Tool Output]: {tool_output}")
-                
-        except Exception as e:
-            tool_output = f"Error: {str(e)}"
-            print(f"  {CLI_RED}<< {tool_output}{CLI_CLR}")
+            tool_output = ""
+            try:
+                if isinstance(tool_obj, Req_AnalyzeWithCode):
+                    print(f"  {CLI_BLUE}>> CodeAgent: {tool_obj.query}{CLI_CLR}")
+                    code_prompt = build_code_agent_prompt(tool_obj.query)
+                    res = code_agent.run(
+                        code_prompt,
+                        store_warehouse_df=store_warehouse_df,
+                        additional_data=tool_obj.additional_data or {},
+                    )
+                    tool_output = f"Analysis: {res}"
+                    print(f"  {CLI_GREEN}<< Code OK{CLI_CLR}")
+                else:
+                    tool_output = get_api_call(store_api, tool_obj)
+                    
+            except Exception as e:
+                tool_output = f"Error: {str(e)}"
+                print(f"  {CLI_RED}<< {tool_output}{CLI_CLR}")
+                final_tool_output = f"{tool_name}: {tool_output}"
+                break
+
+            final_tool_output = f"{tool_name}: {tool_output}"
 
         # Add to sliding window
         assistant_msg = {
@@ -254,7 +269,7 @@ def run_agent(
         }
         tool_output_msg = {
             "role": "user",
-            "content": f"Tool Output: {tool_output}",
+            "content": f"Tool Output: {final_tool_output}",
         }
 
         recent_interactions = [(assistant_msg, tool_output_msg)]
