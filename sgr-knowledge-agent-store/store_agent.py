@@ -177,7 +177,7 @@ def run_agent(
         move = completion.choices[0].message.parsed
 
         # Update accumulated knowledge from this turn
-        accumulated_knowledge.append(move.knowledges)
+        accumulated_knowledge.append(move.knowledge)
 
         # Log Decision Type
         met_count = sum(1 for c in move.state_assessment if c.status == "Met")
@@ -186,7 +186,7 @@ def run_agent(
         print(f"\n[Knowledge]: {'\\n'.join([str(item) for item in accumulated_knowledge])}")
         print(f"[State]: {met_count}/{len(move.state_assessment)} Met -> {decision_type}")
         print(f" {move.state_assessment}\n")
-        print(f"[Thought]: {move.thought_process}\n")
+        print(f"[Thought]: {move.next_action_thought}\n")
         print(f"[Decision]: {move.decision}\n")
 
         # --- COMPLETION HANDLER ---

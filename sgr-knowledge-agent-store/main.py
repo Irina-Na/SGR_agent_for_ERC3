@@ -15,8 +15,8 @@ def main():
     res = core.start_session(
         benchmark="store",
         workspace="ira",
-        name=f"{MODEL_ID} {CRITERIA_MODEL_ID} + operation sequences + parser + ref knowledge",
-        architecture="SGR Agent + code agent + Added data about API + create minimal operation sequences + store parser + knowledge collection and criteria push up",
+        name=f"{MODEL_ID} {CRITERIA_MODEL_ID} + operation sequences + crit.thougts + parser + ref knowledge",
+        architecture="SGR Agent + code agent + Added data about API + create minimal operation sequences + store parser + achivement and action thougths divided + knowledge collection and criteria push up in prompt",
         )
 
     print(f"Session ID: {res.session_id}")
