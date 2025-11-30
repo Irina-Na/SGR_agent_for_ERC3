@@ -183,11 +183,11 @@ def run_agent(
         met_count = sum(1 for c in move.state_assessment if c.status == "Met")
         decision_type = "Action" if isinstance(move.decision, PerformAction) else "Finish"
 
-        print(f"\n[Knowledge]: {'\\n'.join([str(item) for item in accumulated_knowledge])}")
+        print(f"\n[Knowledge]: {'\n'.join([str(item) for item in accumulated_knowledge])}")
         print(f"[State]: {met_count}/{len(move.state_assessment)} Met -> {decision_type}")
-        print(f" {move.state_assessment}\n")
-        print(f"[Thought]: {move.next_action_thought}\n")
-        print(f"[Decision]: {move.decision}\n")
+        print(f" {"\n".join([str(c) for c in move.state_assessment])}")
+        print(f"\n[Thought]: {move.next_action_thought}")
+        print(f"\n[Decision]: {move.decision}")
 
         # --- COMPLETION HANDLER ---
         if isinstance(move.decision, ImpossibleToAchive):
@@ -265,7 +265,11 @@ def run_agent(
         # Add to sliding window
         assistant_msg = {
             "role": "assistant",
-            "content": json.dumps(move.model_dump(mode="json")),
+            "content": (
+                f"State_Assessment: {json.dumps([c.model_dump(mode='json') for c in move.state_assessment])}"
+                f"next_action_thought: {json.dumps(move.next_action_thought)}"
+                f"next_action_thought: {json.dumps(move.decision.model_dump(mode='json'))}"
+            ),
         }
         tool_output_msg = {
             "role": "user",

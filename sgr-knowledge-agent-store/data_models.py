@@ -100,8 +100,8 @@ class SuccessCriteria(BaseModel):
 
 class CriterionState(BaseModel):
     criteria_id: str
-    thought_about_achievement: str = Field(..., description="Review the criterion and all your knowledges. Confirm you’ve checked the additional conditions listed in the criterion to achieve maximum effect.")
-    #evidence: str = Field(..., description="Quote tool output proving this.") 
+    thought_about_achievement: str = Field(..., description="Review all your knowledges. Confirm you’ve checked the additional conditions listed in the criterion to achieve maximum effect.")
+    trick: str = Field(..., description="Suggest what else can be tried to find more successful ways to achieve the goal.") 
     status: Literal["Met", "Not Met"]
     
     

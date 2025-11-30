@@ -97,14 +97,15 @@ def get_api_call(store_api, tool_obj):
     try:
         res = store_api.dispatch(tool_obj)
         tool_output = res.model_dump_json(exclude_none=True, exclude_unset=True)
-        print(f"\n  {CLI_GREEN}<< API OK{CLI_CLR}")
-        print(f"\n [Tool Output]: {tool_output}\n")
+        print(f"{CLI_GREEN}<< API OK{CLI_CLR}")
+        print(f"[Tool Output]: {tool_output}\n")
 
         return tool_output
     except Exception as e:
         err = f"Checkout failed: {e}"
         print(f"{CLI_RED}{err}{CLI_CLR}")
-        return err
+        # Bubble up so the agent loop stops the sequence and surfaces the failure.
+        raise
 
 
 def check_coupon(store_api, payload: CheckCoupon):
