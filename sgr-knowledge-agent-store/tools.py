@@ -6,7 +6,6 @@ import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
 from erc3 import store
-from langfuse import observe
 from data_models import CheckCoupon, SuccessCriteria
 from prompts import CRITERIA_SYSTEM_PROMPT
 
@@ -17,8 +16,8 @@ CLI_YELLOW = "\x1B[33m"
 CLI_CLR = "\x1B[0m"
 
 # Load environment variables for API keys.
-# Ensure we always load the package-local .env (contains Langfuse keys) even if the
-# process is started from the repo root that has a different .env without Langfuse.
+# Ensure we always load the package-local .env (contains lf keys) even if the
+# process is started from the repo root that has a different .env without lf.
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR.parent / ".env")
 load_dotenv(BASE_DIR / ".env", override=False)
@@ -40,6 +39,9 @@ openai_client = OpenAI(
     api_key=OPENAI_API_KEY,
 )
 
+from langfuse import get_client, observe
+
+lf = get_client()
 
 def get_llm_client(provider: Literal["nebius", "openai"]) -> OpenAI:
     """Return the correct OpenAI-compatible client based on provider."""
@@ -153,7 +155,7 @@ def check_coupon(store_api, payload: CheckCoupon):
 
     return response
 
-@observe()
+@observe(name="plan", as_type="generation")
 def get_criteria(
     model_id: str,
     task_text: str,
@@ -181,3 +183,15 @@ def get_criteria(
     except Exception as e:
         print(f"{CLI_RED}CRITICAL FAILURE in criteria generation: {e}{CLI_CLR}")
         raise e
+
+
+@observe(as_type="generation", name="llm_step")
+def run_llm_step(provider, model_id: str, current_log, response_format):
+    client = get_llm_client(provider)
+
+    completion = client.beta.chat.completions.parse(
+        model=model_id,
+        messages=current_log,
+        response_format=response_format,
+    )
+    return completion

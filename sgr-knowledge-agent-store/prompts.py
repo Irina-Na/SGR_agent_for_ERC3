@@ -21,7 +21,7 @@ You are a Online Store Assistant.
 **TASK**:
     {task_text}
 
-**PRODUCTS**:
+**AVAILABLE PRODUCTS ON START**:
     "sku" - product id for adding to the basket
     "name" - product market name
     "available" - quantity in stock. but Always re-check product availability in `Req_CheckoutBasket` before finishing the task.
