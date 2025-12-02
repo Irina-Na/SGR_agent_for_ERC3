@@ -1,49 +1,59 @@
-# ERC3 Store Agents
+﻿# ERC3 Agents
 
-Два готовых агента для бенчмарка ERC3 "store": простой SGR‑агент (NextStep от https://github.com/trustbit/erc3-agents) и версия с памятью, экстракцией знаний и агентом кодировщиком от smolagents.
+Это репозиторий с агентами под два бенчмарка ERC3.
 
-## Что внутри
-- `sgr-vanilla-agent-store` — минимальный Schema-Guided Reasoning цикл с OpenAI (`gpt-4.1-mini` по умолчанию).
-- `sgr-knowledge-agent-store` — расширенный агент: формулирует критерии успеха, ведет сжатую память, умеет прогонять код через smolagents, работает как с OpenAI, так и с Nebius (`gpt-5.1` по умолчанию).
-- `/res` — консольные скриншоты результата.
+- **store** — Benchmark for an online shop with a product catalogue, discounts and checkout basket. Agent needs to purchase proper products by putting them into the basket and checking out. Terminate task early, if it is not doable.
+- **erc3-dev** — Benchmark with a set of APIs for the Enterprise RAG Challenge 3: AI Agents. This is Aetherion Analytics Gmb. Check out company wiki via API for more insights. Especially check the rulebook.md. NB: In production ERC3, there will be multiple companies with multiple different backstories.
 
-## Требования
+## Что лежит в репо
+- `sgr-vanilla-agent-store` — базовый Schema-Guided Reasoning агент для магазина на OpenAI (`gpt-4.1-mini` по умолчанию). (копия vanilla-агента из https://github.com/trustbit/erc3-agents)
+- `sgr-knowledge-agent-store` — вариант для магазина с RAG на векторке, поверх smolagents; можно переключить OpenAI или Nebius (`gpt-5.1`).
+- `sgr-vanilla-agent-erc3` — базовый Schema-Guided Reasoning агент для erc3-dev (копия vanilla-агента из https://github.com/trustbit/erc3-agents/tree/main/sgr-agent-erc3).
+- `res` — скриншоты и вспомогательные артефакты.
+
+## Требования и переменные окружения
 - Python 3.10+ и `pip`.
-- Аккаунт в ERC3 и `ERC3_API_KEY`.
-- Ключ для LLM: `OPENAI_API_KEY` (для обоих), опционально `NEBIUS_API_KEY` и `NEBIUS_API_BASE` (для Nebius, базовый URL уже зашит).
+- Ключ ERC3: `ERC3_API_KEY`.
+- Ключи LLM: `OPENAI_API_KEY` (для OpenAI) и, при работе через Nebius, `NEBIUS_API_KEY` + опционально `NEBIUS_API_BASE`.
 
-Пример `.env` в корне:
+Пример `.env`:
 ```
 ERC3_API_KEY=key-...
 OPENAI_API_KEY=sk-...
-NEBIUS_API_KEY=nb-...          # нужно только knowledge-агенту
-# NEBIUS_API_BASE=https://api.studio.nebius.com/v1/  # если хотите переопределить
+NEBIUS_API_KEY=nb-...
+# NEBIUS_API_BASE=https://api.studio.nebius.com/v1/
+
 ```
 
 ## Быстрый старт
-1) Клонируйте репозиторий и при желании создайте виртуальное окружение.  
-2) Положите `.env` в корень (ключи подтягиваются из него).  
-3) Установите зависимости конкретного агента и запустите его.
+1) Создайте и активируйте виртуальное окружение.  
+2) Скопируйте `.env.example` или заполните `.env` по образцу выше.  
+3) Установите зависимости и запустите нужный агент.
 
-### Запуск простого агента (`sgr-vanilla-agent-store`)
+### Магазин (vanilla)
 ```
 cd sgr-vanilla-agent-store
 pip install -r requirements.txt
 python main.py
 ```
-Настройте модель и метаданные сессии в `sgr-vanilla-agent-store/main.py` (поля `MODEL_ID`, `workspace`, `name`).
+Параметры модели, workspace и имени агента меняются в `sgr-vanilla-agent-store/main.py`.
 
-### Запуск агента с памятью и смолкодом (`sgr-knowledge-agent-store`)
+### Магазин (knowledge)
 ```
 cd sgr-knowledge-agent-store
 pip install -r requirements.txt
 python main.py
 ```
-По умолчанию `main.py` использует OpenAI. Поменяйте параметр `provider` в вызове `run_agent` на `"nebius"`, если хотите работать через Nebius (требуется `NEBIUS_API_KEY`).
+Для переключения провайдера обновите `provider` в `run_agent` и убедитесь, что заданы соответствующие ключи.
 
-## Полезно знать
-- Агент сам стартует/завершает задачи через `ERC3` SDK; после выполнения сессия отправляется `submit_session`.
-- Снимки консоли лежат в `res/console.png`; UI сессии — на https://erc.timetoact-group.at/.
+### ERC3-dev (NextStep SGR)
+```
+cd sgr-vanilla-agent-erc3
+pip install -r requirements.txt
+python main.py
+```
+Изучите `sgr-vanilla-agent-erc3/main.py` и `store_agent.py` для настройки модели, workspace и поведения.
 
-## Поддержка
-Вопросы по соревнованию — в Discord, ссылка приходит в письме после регистрации на ERC3.
+## Полезное
+- Агент для магазина работает с ERC3 SDK и отправляет сессии через `submit_session`.
+- UI бенчмарка магазина можно посмотреть на https://erc.timetoact-group.at/ (см. скрин `res/console.png`).
