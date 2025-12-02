@@ -1,6 +1,6 @@
 CRITERIA_SYSTEM_PROMPT = """
-this is task for online shop assistant. Online shop with a product catalogue, discounts by coupons and basket.
 Extract only the core state conditions that must be true when the task is successfully completed.
+Making a purchase is not just adding items to the basket, but `Req_CheckoutBasket`.
 Use only information explicitly stated in the request — do not infer or introduce new requirements.
 Do not describe actions, only the final verifiable state.
 """.strip()

@@ -182,7 +182,7 @@ def run_agent(
                     hint = "You must continue working. Use tricks or generate new one"
                     
                     # Add to sliding window
-                    current_log.append({
+                    current_log[-1].update({
                         "role": "user",
                         "content": (
                                 f"You decide to FinishTask but SYSTEM ERROR: Criteria not met ({unmet[0]}). {hint}"
@@ -233,12 +233,20 @@ def run_agent(
                 # Update accumulated knowledge from this turn
             
             # Build current context: base + knowledge summary + recent window
+            current_log[-2].update({
+                "role": "assistant",
+                "content": (
+                    f"ORIGINAL REQUEST:\n{task.task_text}\n\n"
+                    f"PREVIOUS STEPS KNOWLEDGES: {'\n'.join([str(item) for item in accumulated_knowledge])}\n\n"
+                ),
+            },
+             )
             current_log[-1].update({
                 "role": "user",
                 "content": (
                     f"PREVIOUS ACTION OUTPUT: {'\n'.join(final_tool_output)}"
-                    "These suggestions not mandatory, but may help in achieving the goal if previous actions have not been successful:"
-                    f"Trick thoughts: {json.dumps([f"{c.criteria_id} {c.trick}" for c in move.state_assessment])}\n"
+                    "\nThese suggestions not mandatory, but may help in achieving the goal if previous actions have not been successful:"
+                    f"\nTrick thoughts: {json.dumps([f"{c.criteria_id} {c.trick}" for c in move.state_assessment])}"
                 ),
             })
             
