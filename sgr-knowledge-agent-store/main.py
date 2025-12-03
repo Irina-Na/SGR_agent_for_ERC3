@@ -36,7 +36,7 @@ def main():
         
         try:
   
-            run_agent(MODEL_ID, CRITERIA_MODEL_ID, core, task , provider=platform, run_name=task.spec_id,)
+            run_agent(MODEL_ID, CRITERIA_MODEL_ID, core, task , provider=platform)
         except Exception as e:
             print(f"CRITICAL FAILURE: {e}")
             # Optional: Fail the task explicitly if needed, 

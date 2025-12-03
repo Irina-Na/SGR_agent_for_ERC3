@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from erc3 import store
 
-from data_models import CheckCoupon, SuccessCriteria
 from prompts import CRITERIA_SYSTEM_PROMPT
+from data_models import SuccessCriteria
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
@@ -18,17 +18,17 @@ CLI_CLR = "\x1B[0m"
 
 # Load environment variables for API keys
 load_dotenv()
-
 from langfuse import get_client, observe
 
 lf = get_client()
-
 # --- Nebius config ---
 NEBIUS_API_KEY = os.environ["NEBIUS_API_KEY"]
 NEBIUS_API_BASE = "https://api.studio.nebius.com/v1/"
 
 # --- OpenAI config (NON-Nebius) ---
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+MAX_COMPLETION_TOKENS=16384
 
 # --- Clients ---
 nebius_client = OpenAI(
@@ -40,7 +40,6 @@ openai_client = OpenAI(
     api_key=OPENAI_API_KEY,
 )
 
-MAX_COMPLETION_TOKENS=16384
 
 
 def get_llm_client(provider: Literal["nebius", "openai"], model_id) -> tuple[OpenAI, str]:
@@ -50,47 +49,6 @@ def get_llm_client(provider: Literal["nebius", "openai"], model_id) -> tuple[Ope
     if provider == "nebius":
         return nebius_client, model_id
     raise ValueError(f"Unknown provider: {provider}")
-
-
-def fetch_available_products_list(
-    store_api,
-    page_size: Optional[int] = None,
-) -> pd.DataFrame:
-    """
-    Fetch all products via Req_ListProducts using a single store client and
-    return only items that are in stock as a pandas DataFrame.
-
-    - If page_size is None (default), uses limit=0 to ask the API for the
-      maximum allowed page in one call.
-    - If page_size is set, paginates using next_offset and the provided limit
-      to avoid exceeding API limits.
-    """
-    products: List[dict] = []
-
-    limit = 0 if page_size is None else page_size
-    offset = 0
-
-    while True:
-        response = store_api.dispatch(
-            store.Req_ListProducts(limit=limit, offset=offset)
-        )
-
-        for p in response.products:
-            if p.available and p.available > 0:
-                products.append(
-                    {
-                        "sku": p.sku,
-                        "name": p.name,
-                        "price": p.price,
-                        "available": p.available,
-                    }
-                )
-        if response.next_offset <= 0:
-            break
-        limit = len(response.products)
-        offset += limit
-
-    return products
 
 
 def get_api_call(store_api, tool_obj):
@@ -104,53 +62,6 @@ def get_api_call(store_api, tool_obj):
         err = f"Checkout failed: {e}"
         print(f"{CLI_RED}{err}{CLI_CLR}")
         return err
-
-
-def check_coupon(store_api, payload: CheckCoupon):
-    """
-    Clear the basket, add requested items, apply the coupon, and return basket state.
-    """
-    basket_state = store_api.dispatch(store.Req_ViewBasket())
-
-    for item in getattr(basket_state, "items", []) or []:
-        if item.quantity <= 0:
-            continue
-        store_api.dispatch(
-            store.Req_RemoveItemFromBasket(sku=item.sku, quantity=item.quantity)
-        )
-
-    if getattr(basket_state, "coupon", None):
-        try:
-            store_api.dispatch(store.Req_RemoveCoupon(coupon=basket_state.coupon))
-        except Exception:
-            pass
-
-    for item in payload.items:
-        store_api.dispatch(
-            store.Req_AddProductToBasket(sku=item.sku, quantity=item.quantity)
-        )
-
-    if payload.coupon:
-        store_api.dispatch(store.Req_ApplyCoupon(coupon=payload.coupon))
-
-    final_basket = store_api.dispatch(store.Req_ViewBasket())
-    response = {
-        "items": [
-            {"sku": i.sku, "quantity": i.quantity, "price": i.price}
-            for i in getattr(final_basket, "items", []) or []
-        ],
-        "subtotal": getattr(final_basket, "subtotal", 0),
-        "total": getattr(final_basket, "total", 0),
-    }
-
-    if getattr(final_basket, "coupon", None):
-        response["coupon"] = final_basket.coupon
-    discount_value = getattr(final_basket, "discount", None)
-    if discount_value:
-        response["discount"] = discount_value
-
-    return response
-
 
 @observe(name="plan&criteria", as_type="generation")
 def get_criteria(
@@ -180,9 +91,8 @@ def get_criteria(
     except Exception as e:
         print(f"{CLI_RED}CRITICAL FAILURE in criteria generation: {e}{CLI_CLR}")
         raise e
-
-
-   
+    
+    
 @observe(as_type="generation", name="llm_step")
 def run_llm_step(provider, model_id: str, current_log, response_format, task_id, api):
     client, model_for_log = get_llm_client(provider, model_id)
