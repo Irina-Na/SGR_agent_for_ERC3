@@ -10,6 +10,8 @@ CLI_GREEN = "\x1B[32m"
 CLI_BLUE = "\x1B[34m"
 CLI_CLR = "\x1B[0m"
 
+MAX_LLM_RETRIES = 3  # how many extra times to re-request LLM on invalid/empty parsed result
+
 
 from langfuse import get_client
 
@@ -47,9 +49,22 @@ def run_agent(model: str, api: ERC3, task: TaskInfo, provider: Literal["nebius",
             step = f"step_{i + 1}"
             print(f"Next {step}... ", end="")
 
-            completion = run_llm_step(provider, model, log, NextStep, task.task_id, api)
-            
-            job = completion.choices[0].message.parsed  # need to return completion for correct completion.usage logging in langfuse.
+            job = None
+            for attempt in range(MAX_LLM_RETRIES + 1):
+                try:
+                    parsed = run_llm_step(provider, model, log, NextStep, task.task_id, api).choices[0].message.parsed
+                    # ensure parsed is a valid NextStep instance
+                    if isinstance(parsed, NextStep):
+                        job = parsed
+                        break
+                except Exception as e:
+                    print(f"{CLI_RED}LLM parse error: {e}{CLI_CLR}")
+                if attempt < MAX_LLM_RETRIES:
+                    print(f"{CLI_RED}Invalid NextStep, retrying ({attempt + 1}/{MAX_LLM_RETRIES})...{CLI_CLR}")
+
+            if not job:
+                print(f"{CLI_RED}Failed to obtain valid NextStep, aborting task loop.{CLI_CLR}")
+                break
 
             # print next sep for debugging
             print(job.plan_remaining_steps_brief[0], f"\n  {job.function}")
@@ -74,7 +89,8 @@ def run_agent(model: str, api: ERC3, task: TaskInfo, provider: Literal["nebius",
                 txt = result.model_dump_json(exclude_none=True, exclude_unset=True)
                 print(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
             except ApiException as e:
-                txt = e.detail
+                # surface a meaningful error back into the dialog for the next LLM step
+                txt = e.detail or (getattr(e, "api_error", None) and getattr(e.api_error, "error", None)) or str(e)
                 # print to console as ascii red
                 print(f"{CLI_RED}ERR: {e.api_error.error}{CLI_CLR}")
 
