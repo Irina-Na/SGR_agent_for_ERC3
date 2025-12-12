@@ -1,0 +1,2 @@
+"""Lightweight API analyser package."""
+
