@@ -12,6 +12,7 @@ from agent_api_analyser.fixture_resolver import FixtureResolver
 from agent_api_analyser.report_builder import ReportBuilder
 from agent_api_analyser.scenario_generator import ScenarioGenerator
 from agent_api_analyser.wrapper_suggester import WrapperSuggester
+from agent_api_analyser.scenario_logger import write_scenarios
 
 
 def _start_api():
@@ -47,12 +48,14 @@ def main():
     generator = ScenarioGenerator(args.model)
     docs_text = generator.load_docs(args.docs)
     scenarios = generator.generate(catalog, docs_text, "read")
+    scenarios_path = write_scenarios(scenarios)
 
     results = Executor(api, fixtures).run(scenarios, allow_writes=args.allow_writes)
     outcome = Evaluator().evaluate(results)
     suggestions = WrapperSuggester().suggest(results)
 
     path = ReportBuilder().write(outcome, suggestions)
+    print(f"Scenarios saved to {Path(scenarios_path).as_posix()}")
     print(f"Report saved to {Path(path).as_posix()}")
 
 

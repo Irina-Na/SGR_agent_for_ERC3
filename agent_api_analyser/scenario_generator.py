@@ -40,10 +40,23 @@ class ScenarioGenerator:
     def generate(
         self, catalog: list, docs_text: str, kind: Literal["read", "write"] = "read"
     ) -> list[Scenario]:
-        allowed = [c.name for c in catalog if getattr(c, "kind", "read") == kind]
+        allowed = [c for c in catalog if getattr(c, "kind", "read") == kind]
+        allowed_names = [c.name for c in allowed]
+        required_by_req = {
+            c.name: (c.required or []) for c in allowed
+        }
+        field_specs = {c.name: c.fields for c in allowed}
         prompt = f"""You are creating {kind} API checks.
-Use only request names from: {allowed}
-Use placeholders $employee_id, $project_id, $customer_id, $time_entry_id.
+Use only request names from: {allowed_names}
+Each scenario must include all required fields for the chosen request exactly by name:
+{required_by_req}
+- Field specs (types/defaults/limits/enums/format) per request:
+{field_specs}
+- Respect defaults when present; otherwise pick safe values within min/max or from enum.
+- Always include pagination args when required: offset=0, limit=20
+- When date_from/date_to are required, provide an ISO range like "2025-01-01" and "2025-01-31"
+- Use placeholders $employee_id, $project_id, $customer_id, $time_entry_id only for ids;
+  never rename required keys (use 'id' not 'customer_id'/'employee_id', and 'file' for wiki files).
 Return at most 8 scenarios."""
         messages = [
             {"role": "system", "content": "Generate lean API test intents for an internal agent."},

@@ -4,6 +4,13 @@ from erc3 import ApiException
 class FixtureResolver:
     def __init__(self) -> None:
         self.values: dict[str, str | int | None] = {}
+        # normalize common aliases coming from LLMs to API-required keys
+        self.alias_map: dict[str, str] = {
+            "customer_id": "id",
+            "employee_id": "id",
+            "project_id": "id",
+            "wiki_id": "file",
+        }
 
     def _first_id(self, fn, attr: str) -> str | None:
         try:
@@ -25,8 +32,9 @@ class FixtureResolver:
             return {}
         out = {}
         for k, v in args.items():
+            key = self.alias_map.get(k, k)
             if isinstance(v, str) and v.startswith("$"):
-                out[k] = self.values.get(v[1:], v)
+                out[key] = self.values.get(v[1:], v)
             else:
-                out[k] = v
+                out[key] = v
         return out
