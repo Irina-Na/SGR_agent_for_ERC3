@@ -1,5 +1,5 @@
 Security Policy Planner & Checker
-================================
+=================================
 
 Purpose
 -------
@@ -9,11 +9,11 @@ Components
 ----------
 - `sgr-knowledge-agent-erc3_test/fetch_wiki.py`: downloads wiki into `docs/` and builds `docs/wiki_index.json` (size/tokens/sha1).
 - `agent_security_analyser/policy_planner.py`: LLM-based planner/extractor.
-    - `generate_plan(...)` → `plan_id`, `PlanPayload`.
-    - `run_plan(plan_payload, ...)` → list of `PolicyRule`.
-    - `materialize_plan_and_policies()` → end-to-end (plan + extract) and saves under `agent_security_analyser/plans/<id>/plan.json` and `agent_security_analyser/policy/<id>/policies.json`.
+    - `generate_plan(...)` -> `plan_id`, `PlanPayload`.
+    - `run_plan(plan_payload, ...)` -> (`List[PolicyRule]`, `List[PolicyConstraint]`).
+    - `materialize_plan_and_policies()` -> end-to-end (plan + extract) and saves under `agent_security_analyser/plans/<id>/plan.json` and `agent_security_analyser/policy/<id>/policies.json` (includes `constraints_map` keyed by intent).
     - Helpers: `save_plan`, `load_plan`, `save_policies`.
-- `agent_security_analyser/security_checker.py`: runtime `classify(intent, user_ctx, resource_ctx, policy_dict)` → `Decision(allow|deny|clarify, reason)`.
+- `agent_security_analyser/security_checker.py`: runtime `classify(intent, user_ctx, resource_ctx, policy_dict)` -> `Decision(allow|deny|clarify, reason)`.
 - `agent_security_analyser/cli.py`: CLI for plan/extract/materialize.
 
 Prereqs
@@ -25,7 +25,9 @@ Prereqs
 Quick start (end-to-end)
 ------------------------
 ```bash
-python -m agent_security_analyser.cli materialize
+python -m agent_security_analyser.cli materialize \
+  --readme-path sgr-knowledge-agent-erc3_test/docs/README.md \
+  --extra-policy-file sgr-knowledge-agent-erc3_test/docs/prep_desc.md
 # Outputs paths to plan.json and policies.json
 ```
 
@@ -33,24 +35,39 @@ Manual steps (separately)
 -------------------------
 1) Generate only the plan:
 ```bash
-python -m agent_security_analyser.cli plan
+python -m agent_security_analyser.cli plan \
+  --readme-path sgr-knowledge-agent-erc3_test/docs/README.md
 # Inspect/edit agent_security_analyser/plans/<plan_id>/plan.json if desired
 ```
+
+```powershell
+python -m agent_security_analyser.cli plan --readme-path sgr-knowledge-agent-erc3_test/docs/README.md
+```
+
 2) Extract policies from an existing plan:
 ```bash
-python -m agent_security_analyser.cli extract --plan-path agent_security_analyser/plans/<plan_id>/plan.json
+python -m agent_security_analyser.cli extract \
+  --plan-path agent_security_analyser/plans/<plan_id>/plan.json \
+  --extra-policy-file sgr-knowledge-agent-erc3_test/docs/prep_desc.md
 ```
+
+```powershell
+python -m agent_security_analyser.cli extract --plan-path  agent_security_analyser\plans\plan-20251214T184753Z\plan.json --extra-policy-file sgr-knowledge-agent-erc3_test\docs\prep_desc.md
+```
+
 
 Runtime enforcement
 -------------------
-- Load the latest `policy/<plan_id>/policies.json`, normalize into your `policy_dict` (map intents to constraints).
+- Load the latest `policy/<plan_id>/policies.json`; it already contains `constraints` and `constraints_map` keyed by intent produced from the wiki.
 - Before executing a task: detect intent, gather `user_ctx` / `resource_ctx`, call `classify(...)`.
-  - `deny` → respond `denied_security`.
-  - `clarify` → respond `none_clarification_needed`.
-  - `allow` → continue normal flow.
+  - `deny` -> respond `denied_security`.
+  - `clarify` -> respond `none_clarification_needed`.
+  - `allow` -> continue normal flow.
 
 Notes
 -----
 - `plan_id` is timestamp-based (LLM never sets it).
 - `PolicyRule.sources` is required and must be non-empty for provenance.
 - Token counts come from `wiki_index`; fallback recompute is only for missing/invalid values.
+
+

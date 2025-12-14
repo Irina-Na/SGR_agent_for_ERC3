@@ -71,10 +71,41 @@ class PolicyRule(BaseModel):
     clarify: List[str] = Field(default_factory=list, description="When to ask for more detail")
     scope: List[str] = Field(default_factory=list, description="Roles/levels/resources/locations constraints")
     sources: List[str] = Field(..., min_length=10, description="Wiki file paths used (non-empty)")
+    intents: List[str] = Field(
+        default_factory=list,
+        description="Canonical intents this rule affects (e.g., public_answer, salary_view, project_status_change)",
+    )
+
+
+class PolicyConstraint(BaseModel):
+    intent: str = Field(..., description="Normalized intent id (e.g., salary_view, project_status_change)")
+    roles: List[str] = Field(default_factory=list, description="Allowed roles/levels; empty means any authenticated")
+    override_roles: List[str] = Field(
+        default_factory=list, description="Roles that can override responsibility limits (e.g., exec)"
+    )
+    locations: List[str] = Field(default_factory=list, description="Allowed locations; use ['any'] if unrestricted")
+    allow_if_exec: bool = Field(
+        default=False, description="If true, exec/level1 may bypass stricter role/location checks for this intent"
+    )
+    needs_responsibility: bool = Field(
+        default=False, description="Require requester to be responsible/lead/owner for the target resource"
+    )
+    needs_assignment: bool = Field(
+        default=False, description="Require requester to be on the project/team (e.g., for time logging)"
+    )
+    needs_clarification: bool = Field(
+        default=False, description="Require disambiguation (who/what) before acting for this intent"
+    )
+    sensitivity: Literal["public", "internal", "sensitive", "highly_sensitive"] = Field(
+        "internal", description="Data classification for this intent"
+    )
+    sources: List[str] = Field(..., min_length=1, description="Wiki file paths used (non-empty)")
+    rationale: str = Field(..., description="<=2 sentence why these constraints exist")
 
 
 class PolicyExtraction(BaseModel):
     policies: List[PolicyRule]
+    constraints: List[PolicyConstraint] = Field(default_factory=list)
     gaps_or_questions: List[str] | None
 
 
@@ -121,13 +152,21 @@ def load_plan(plan_path: Path) -> tuple[str, PlanPayload]:
     return plan_id, PlanPayload(**payload)
 
 
-def save_policies(plan_id: str, policies: List[PolicyRule], policy_root: Path = POLICY_ROOT) -> Path:
+def save_policies(
+    plan_id: str,
+    policies: List[PolicyRule],
+    constraints: List[PolicyConstraint] | None = None,
+    policy_root: Path = POLICY_ROOT,
+) -> Path:
     policy_dir = policy_root / plan_id
     policy_dir.mkdir(parents=True, exist_ok=True)
+    constraints = constraints or []
     payload = {
         "plan_id": plan_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "policies": [p.model_dump() for p in policies],
+        "constraints": [c.model_dump() for c in constraints],
+        "constraints_map": {c.intent: c.model_dump() for c in constraints if c.intent},
     }
     policy_path = policy_dir / "policies.json"
     save_json(policy_path, payload)
@@ -181,7 +220,8 @@ class SecurityPolicyPlanner:
         plan_id: Optional[str] = None,
         max_batch_tokens: int = 6000,
         docs_root: Path = DEFAULT_DOCS_ROOT,
-        model: str = "gpt-5.1"
+        model: str = "gpt-5.1",
+        readme_path: Path | None = None,
     ) -> tuple[str, PlanPayload]:
         files = wiki_index.get("files", [])
         summary = [
@@ -193,20 +233,22 @@ class SecurityPolicyPlanner:
             if f.get("path")
         ]
         plan_id_to_use = plan_id or unique_run_id("plan")
-        readme_path = docs_root / "README.md"
-        readme_content = readme_path.read_text(encoding="utf-8")
+        readme_to_use = readme_path if readme_path else docs_root / "README.md"
+        readme_content = ""
+        if readme_to_use.exists():
+            readme_content = readme_to_use.read_text(encoding="utf-8")
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You rank wiki files to extract security/access policies. "
+                    "You rank wiki files to extract security/access/data-handling policies. "
                     "Use filename/size/token hints to set priority. "
-                    "Strategies: "
-                    "skip not important files"
-                    "'single' (one file per LLM call),"
-                    "'batch' (split large files into chunks under the provided token limit),"
-                    "'together' (send listed files together)."
-                    "Prefer files with names like rule/policy/security/access/guardrail/playbook."
+                    "Strategies: skip (only if clearly irrelevant), 'single' (one file), "
+                    "'batch' (split large files under the token limit), 'together' (send listed files together). "
+                    "ALWAYS include files that define roles/levels, locations/offices, systems/APIs, or data categories "
+                    ". Do not mark them as skip even if the filename "
+                    "does not contain policy/security keywords. Prefer rule/policy/security/guardrail/playbook files "
+                    "as highest priority but keep supporting context grouped at lower priority if needed. "
                     "Mark only real paths from the index."
                 ),
             },
@@ -239,15 +281,30 @@ class SecurityPolicyPlanner:
             {
                 "role": "system",
                 "content": (
-                    "Extract security/access/data-protection policies into PolicyRule items:\n"
+                    "Extract security/access/data-protection policies into PolicyRule and PolicyConstraint items.\n"
+                    "Canonical intents (use when relevant, do not invent outside this set unless explicitly present):\n"
+                    "- public_answer, wiki_read, customer_read, project_read, project_status_change, project_team_change,\n"
+                    "  time_entry_create, salary_view, salary_change, pii_view.\n"
+                    "PolicyRule fields:\n"
                     "- name: short identifier\n"
                     "- summary: 1-2 line essence of the rule\n"
-                    "- allow: explicitly permitted actions/conditions (can be empty)\n"
-                    "- deny: explicitly blocked actions/conditions (can be empty)\n"
-                    "- clarify: when to ask for more detail (can be empty)\n"
-                    "- scope: roles/levels/resources/locations constraints\n"
+                    "- allow / deny / clarify / scope: as stated in the content\n"
+                    "- intents: map the rule to relevant intents from the canonical set\n"
+                    "- sources: wiki paths you used (non-empty)\n"
+                    "PolicyConstraint fields (drive runtime enforcement):\n"
+                    "- intent: canonical intent id\n"
+                    "- roles: allowed roles/levels (e.g., exec, lead, core)\n"
+                    "- override_roles: roles that can bypass responsibility checks (e.g., exec)\n"
+                    "- locations: allowed locations/offices or ['any']\n"
+                    "- allow_if_exec: true when exec/level1 can override stricter checks\n"
+                    "- needs_responsibility: true when requester must be responsible/lead/owner for target\n"
+                    "- needs_assignment: true when requester must be on the project/team (e.g., time logging)\n"
+                    "- needs_clarification: true when the rule requires disambiguation before acting\n"
+                    "- sensitivity: public/internal/sensitive/highly_sensitive as implied by data classification\n"
                     "- sources: wiki paths you used\n"
-                    "Only include the most important rules. Do not invent IDs. Leave lists empty if not applicable."
+                    "- rationale: short why this constraint exists\n"
+                    "Ground everything in the provided content; do not hallucinate roles or permissions. "
+                    "If a field is not specified by the content, leave it empty/false rather than guessing."
                 ),
             },
             {
@@ -272,14 +329,21 @@ class SecurityPolicyPlanner:
         docs_root: Path = DEFAULT_DOCS_ROOT,
         wiki_index: Optional[dict] = None,
         max_batch_tokens: int = 6000,
-    ) -> List[PolicyRule]:
+        verbose: bool = False,
+    ) -> tuple[List[PolicyRule], List[PolicyConstraint]]:
         tokens_by_path = {}
         if wiki_index:
             tokens_by_path = {
                 f.get("path"): f.get("tokens") for f in wiki_index.get("files", []) if f.get("path")
             }
-        collected: List[PolicyRule] = []
+        collected_policies: List[PolicyRule] = []
+        collected_constraints: List[PolicyConstraint] = []
         for group in sorted(plan.groups, key=lambda g: g.priority):
+            if verbose:
+                print(
+                    f"[run_plan] priority={group.priority} strategy={group.strategy} paths={group.path_s}",
+                    flush=True,
+                )
             paths = group.path_s if isinstance(group.path_s, list) else [group.path_s]
             if not paths:
                 continue
@@ -297,7 +361,8 @@ class SecurityPolicyPlanner:
             if group.strategy == "single":
                 for rel_path, text in zip(paths, texts):
                     extraction = self.extract_policies_for_chunk(text, [rel_path])
-                    collected.extend(extraction.policies)
+                    collected_policies.extend(extraction.policies)
+                    collected_constraints.extend(extraction.constraints)
                 continue
 
             batches = make_file_batches(
@@ -309,9 +374,10 @@ class SecurityPolicyPlanner:
 
             for batch_paths, batch_text in batches:
                 extraction = self.extract_policies_for_chunk(batch_text, batch_paths)
-                collected.extend(extraction.policies)
+                collected_policies.extend(extraction.policies)
+                collected_constraints.extend(extraction.constraints)
 
-        return collected
+        return collected_policies, collected_constraints
 
 
 def materialize_plan_and_policies(
@@ -321,6 +387,8 @@ def materialize_plan_and_policies(
     policy_root: Path = POLICY_ROOT,
     max_batch_tokens: int = 6000,
     model: str = "gpt-4o-mini",
+    readme_path: Path | None = None,
+    extra_policy_file: Path | None = None,
 ) -> tuple[Path, Path]:
     """
     High-level helper:
@@ -328,6 +396,7 @@ def materialize_plan_and_policies(
     - ask LLM for a plan,
     - save plan under plans/<id>/plan.json,
     - run plan to extract policies,
+    - optionally extract policies from an extra file (e.g., prep_desc.md),
     - save policies under policy/<id>/policies.json.
     Returns (plan_path, policy_path).
     """
@@ -337,17 +406,26 @@ def materialize_plan_and_policies(
         wiki_index,
         max_batch_tokens=max_batch_tokens,
         docs_root=docs_root,
+        readme_path=readme_path,
     )
 
     plan_path = save_plan(plan_id, plan, plans_root=plans_root)
 
-    policies = planner.run_plan(
+    policies, constraints = planner.run_plan(
         plan,
         docs_root=docs_root,
         wiki_index=wiki_index,
         max_batch_tokens=max_batch_tokens,
+        verbose=True,
     )
-    policy_path = save_policies(plan_id, policies, policy_root=policy_root)
+
+    if extra_policy_file and extra_policy_file.exists():
+        extra_text = extra_policy_file.read_text(encoding="utf-8")
+        extraction = planner.extract_policies_for_chunk(extra_text, [str(extra_policy_file)])
+        policies.extend(extraction.policies)
+        constraints.extend(extraction.constraints)
+
+    policy_path = save_policies(plan_id, policies, constraints, policy_root=policy_root)
     return plan_path, policy_path
 
 
@@ -355,6 +433,7 @@ __all__ = [
     "PlanPayload",
     "PlanGroup",
     "PolicyRule",
+    "PolicyConstraint",
     "PolicyExtraction",
     "SecurityPolicyPlanner",
     "materialize_plan_and_policies",
