@@ -20,6 +20,22 @@ from typing import Any, Dict, List
 from dotenv import load_dotenv
 from erc3 import ERC3, ApiException
 
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
+
+
+def count_tokens(text: str, encoding_name: str = "cl100k_base") -> int:
+    """
+    Best-effort token count. If tiktoken is unavailable, fall back to a rough
+    heuristic (chars / 4) to avoid breaking the script.
+    """
+    if tiktoken is None:
+        return max(1, len(text) // 4)
+    enc = tiktoken.get_encoding(encoding_name)
+    return len(enc.encode(text))
+
 
 def build_index_entry(path: str, content: str) -> Dict[str, Any]:
     payload = content.encode("utf-8")
@@ -27,6 +43,7 @@ def build_index_entry(path: str, content: str) -> Dict[str, Any]:
         "path": path,
         "sha1": hashlib.sha1(payload).hexdigest(),
         "size_bytes": len(payload),
+        "tokens": count_tokens(content),
     }
 
 
