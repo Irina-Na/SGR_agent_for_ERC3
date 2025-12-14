@@ -7,3 +7,5 @@ context_*
 
 # Ignore any docs directories and everything inside them
 **/docs/**
+**/plans/**
+**/policy/**
