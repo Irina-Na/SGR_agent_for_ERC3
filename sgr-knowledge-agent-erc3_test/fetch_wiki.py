@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -37,6 +38,22 @@ def count_tokens(text: str, encoding_name: str = "cl100k_base") -> int:
     return len(enc.encode(text))
 
 
+def extract_headers(content: str) -> List[str]:
+    """Return H1/H2 markdown headings as plain strings (# Title)."""
+    headers: List[str] = []
+    pattern = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
+    for line in content.splitlines():
+        m = pattern.match(line)
+        if not m:
+            continue
+        level = len(m.group(1))
+        if level > 2:
+            continue
+        text = m.group(2).strip().rstrip("#").strip()
+        headers.append("#" * level + " " + text)
+    return headers
+
+
 def build_index_entry(path: str, content: str) -> Dict[str, Any]:
     payload = content.encode("utf-8")
     return {
@@ -44,6 +61,7 @@ def build_index_entry(path: str, content: str) -> Dict[str, Any]:
         "sha1": hashlib.sha1(payload).hexdigest(),
         "size_bytes": len(payload),
         "tokens": count_tokens(content),
+        "headers": extract_headers(content),
     }
 
 
