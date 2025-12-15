@@ -24,6 +24,8 @@ nebius_client = OpenAI(base_url=NEBIUS_API_BASE, api_key=NEBIUS_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
+# resource_ctx: данные по проекту/ресурсу — project_location, is_owner_or_lead, user_on_project, target_resolved
+
 def get_llm_client(provider: Literal["nebius", "openai"], model_id: str) -> tuple[OpenAI, str]:
     """Return OpenAI-compatible client and model name for logging."""
     if provider == "openai":
@@ -61,18 +63,34 @@ class MyLLM:
             response_format=response_format,
             max_completion_tokens=self.max_tokens,
         )
-        
-        self.api.log_llm(
-            task_id=self.task.task_id,
-            model=model_for_log,
-            duration_sec=time.time() - started,
-            usage=resp.usage,
-        )
         try:
-            resp.choices[0].message.parsed
+            raw_message = resp.choices[0].message            
         except Exception as e:
             print(f"LLM parse error: {e}")
             print(f"Raw LLM message: {getattr(resp, 'content', resp)}")
             raise
+
+        completion_text = getattr(raw_message, "content", None)
+        if completion_text is None:
+            try:
+                completion_text = raw_message.model_dump_json()
+            except Exception:
+                completion_text = str(raw_message)
+
+        duration = time.time() - started
+        usage = resp.usage
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        cached_prompt_tokens = getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None)
+
+        self.api.log_llm(
+            task_id=self.task.task_id,
+            model=model_for_log,
+            duration_sec=duration,
+            completion=completion_text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_prompt_tokens=cached_prompt_tokens,
+        )
 
         return resp
