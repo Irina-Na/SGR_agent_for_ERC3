@@ -9,3 +9,7 @@ context_*
 **/docs/**
 **/plans/**
 **/policy/**
+
+*.json
+
+**/found_data/**

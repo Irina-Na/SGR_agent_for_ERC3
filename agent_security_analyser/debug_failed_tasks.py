@@ -1,9 +1,9 @@
 """
 Debug helper: fetch ERC tasks and capture texts for known security-policy failures.
 
-The script starts a read-only ERC session, looks up tasks that previously failed
-because of incorrect security handling, and writes their formulations into a
-structured JSON file for easier debugging.
+Two modes:
+- fetch: start a read-only ERC session, find the failing tasks, and save them to JSON.
+- classify: read tasks from JSON and run them through security_checker.llm_classify.
 """
 from __future__ import annotations
 
@@ -11,11 +11,18 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 from dotenv import load_dotenv
 from erc3 import ERC3
+from agent_security_analyser.security_checker import (
+    DATA_ROOT,
+    DEBUG_RESOURCE_CTX,
+    DEBUG_USER_CTX,
+    llm_classify,
+)
 
 
 # Tasks from the gpt4.1 v.0.1.0 dev 62.5 run that were mishandled because
@@ -33,7 +40,11 @@ FAILED_CASES: Sequence[dict] = (
     },
 )
 
-DEFAULT_OUTPUT = Path("agent_security_analyser/plans/security_policy_failures.json")
+DEFAULT_OUTPUT_DIR = Path("agent_security_analyser/plans")
+SPEC_TO_REQUEST = {
+    "nonlead_pauses_project": "project_status_change",
+    "user_asks_for_team_salary": "salary_view",
+}
 
 
 @dataclass
@@ -112,6 +123,7 @@ def _write_output(path: Path, benchmark: str, workspace: str, session_id: str, t
             {
                 "task_id": t.task_id,
                 "spec_id": t.spec_id,
+                "request": SPEC_TO_REQUEST.get(t.spec_id),
                 "task_text": t.task_text,
                 "failure_reason": t.failure_reason,
                 "matched_by": t.matched_by,
@@ -124,14 +136,67 @@ def _write_output(path: Path, benchmark: str, workspace: str, session_id: str, t
     return path
 
 
+def _classify_failures(tasks_path: Path, model: str) -> Path | None:
+    """Classify failing tasks via security_checker.llm_classify and save results."""
+    if not tasks_path.exists():
+        print(f"[llm] tasks file not found: {tasks_path}")
+        return None
+    data = json.loads(tasks_path.read_text(encoding="utf-8"))
+    tasks = data.get("tasks") or []
+    if not tasks:
+        print("[llm] no tasks to classify")
+        return None
+    results: list[dict] = []
+    for t in tasks:
+        request = t.get("request") or SPEC_TO_REQUEST.get(t.get("spec_id"))
+        if not request:
+            continue
+        decision = llm_classify(request, DEBUG_USER_CTX, DEBUG_RESOURCE_CTX, model=model)
+        row = {
+            "task_id": t.get("task_id"),
+            "request": request,
+            "task_text": t.get("task_text"),
+            "decision": decision.__dict__,
+            "model": model,
+            "run_at": datetime.now(timezone.utc).isoformat(),
+        }
+        results.append(row)
+        print(f"[llm] {row['task_id']} -> {decision.status} ({decision.reason})")
+    if not results:
+        print("[llm] nothing classified")
+        return None
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out = DATA_ROOT / f"llm_security_decisions-{ts}.json"
+    out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[llm] saved {len(results)} decisions to {out.as_posix()}")
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Capture ERC tasks that failed security handling in previous runs.")
     parser.add_argument("--benchmark", default=os.getenv("ERC3_BENCHMARK", "erc3-dev"))
     parser.add_argument("--workspace", default=os.getenv("ERC3_WORKSPACE", "ira"))
-    parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
+    parser.add_argument("--output", default=None, help="Where to save fetched tasks (default: plans/security_policy_failures-<ts>.json)")
+    parser.add_argument("--tasks-path", default=None, help="Existing tasks file to classify (default: latest output path logic)")
+    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4.1"))
+    parser.add_argument("--classify-only", action="store_true", help="Skip fetch; classify tasks from --tasks-path")
+    parser.add_argument("--classify-after", action="store_true", help="After fetch, run LLM classification")
     parser.add_argument("--session-name", default="security-debug-task-scan")
     parser.add_argument("--architecture", default="debug-helper")
     args = parser.parse_args()
+
+    # Ensure .env secrets (e.g., OPENAI_API_KEY) are available for both fetch and classify-only modes.
+    load_dotenv()
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    default_output_path = DEFAULT_OUTPUT_DIR / f"security_policy_failures-{ts}.json"
+    output_path = Path(args.output) if args.output else default_output_path
+    tasks_path = Path(args.tasks_path) if args.tasks_path else output_path
+
+    if args.classify_only:
+        _classify_failures(tasks_path, args.model)
+        return
 
     core, session_id = _start_read_session(
         benchmark=args.benchmark,
@@ -142,9 +207,12 @@ def main() -> None:
 
     task_map, spec_map = _collect_tasks(core, session_id)
     matched, missing = _match_failed_tasks(task_map, spec_map, FAILED_CASES)
-    output_path = _write_output(Path(args.output), args.benchmark, args.workspace, session_id, matched, missing)
+    output_path = _write_output(output_path, args.benchmark, args.workspace, session_id, matched, missing)
 
     print(f"Captured {len(matched)} tasks; missing {len(missing)}. Saved to {output_path.as_posix()}")
+
+    if args.classify_after:
+        _classify_failures(output_path, args.model)
 
 
 if __name__ == "__main__":

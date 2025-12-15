@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 DEFAULT_INDEX = Path("sgr-knowledge-agent-erc3_test/docs/wiki_index.json")
 DEFAULT_DOCS_ROOT = Path("sgr-knowledge-agent-erc3_test/docs")
 DEFAULT_FETCH_SCRIPT = Path("sgr-knowledge-agent-erc3_test/fetch_wiki.py")
-FOUND_ROOT = Path("agent_wiki_extraction/found_data")
+FOUND_ROOT = Path("agent_wiki_distillator/found_data")
 
 load_dotenv()
 
