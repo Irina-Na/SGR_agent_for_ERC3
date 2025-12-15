@@ -13,7 +13,7 @@ from langfuse import get_client
 
 lf = get_client()
 
-from lib import MyLLM
+from tools import MyLLM
 
 # this is how you can add custom tools that work slightly better
 class Req_DeleteWikiPage(BaseModel):
@@ -136,6 +136,11 @@ def distill_rules(api: Erc3Client, llm: MyLLM, about: dev.Resp_WhoAmI) -> str:
     context_id = about.wiki_sha1
 
     loc = Path(f"context_{context_id}_v2.json")
+    fallback_loc = Path(__file__).resolve().parent / "context_733815c19ae7c1d13f345a2b2a9aa13c67a74769_v2.json"
+    manual_policy_path = Path(__file__).resolve().parents[1] / "agent_security_analyser" / "policy" / "plan-ideal-manual" / "policies.json"
+    manual_policy_text = None
+    if manual_policy_path.exists():
+        manual_policy_text = manual_policy_path.read_text(encoding="utf-8")
 
     Category = Literal["applies_to_guests", "applies_to_users", "other"]
 
@@ -150,7 +155,10 @@ def distill_rules(api: Erc3Client, llm: MyLLM, about: dev.Resp_WhoAmI) -> str:
         company_execs: List[str]
         rules: List[Rule]
 
-    if  not loc.exists():
+    if not loc.exists():
+        if fallback_loc.exists():
+            loc = fallback_loc
+            '''
         print("New context discovered. Distilling rules once")
         schema = json.dumps(NextStep.model_json_schema())
         prompt = f"""
@@ -173,9 +181,19 @@ Rules must be compact RFC-style, ok to use pseudo code for compactness. They wil
         distilled = distilled.choices[0].message.parsed
 
         loc.write_text(distilled.model_dump_json(indent=2), encoding="utf-8")
-
+            '''
+        else:
+            raise FileNotFoundError(f"Expected distilled wiki cache at {loc}")
+    raw_cache = json.loads(loc.read_text(encoding="utf-8"))
+    if isinstance(raw_cache, dict) and "parsed" in raw_cache:
+        distilled = DistillWikiRules.model_validate(raw_cache["parsed"])
+    elif isinstance(raw_cache, dict) and isinstance(raw_cache.get("content"), str):
+        try:
+            distilled = DistillWikiRules.model_validate_json(raw_cache["content"])
+        except Exception:
+            distilled = DistillWikiRules.model_validate(raw_cache)
     else:
-        distilled = DistillWikiRules.model_validate_json(loc.read_text(encoding="utf-8"))
+        distilled = DistillWikiRules.model_validate(raw_cache)
 
     prompt = f"""You are AI Chatbot automating {distilled.company_name}.
     
@@ -200,10 +218,14 @@ Use available tools to execute task from the current user.
     else:
         relevant_categories.append("applies_to_users")
 
-    for r in distilled.rules:
-        if r.category in relevant_categories:
-            prompt += f"\n- {r.compact_rule}"
-
+    if manual_policy_text:
+        prompt += f"\n\n# Wiki distillation (manual policies)\n{manual_policy_text}\n"
+    else:
+        raise FileNotFoundError(f"Expected distilled wiki at {manual_policy_text}")
+        '''for r in distilled.rules:
+            if r.category in relevant_categories:
+                prompt += f"\n- {r.compact_rule}"
+        '''
     # append at the end to keep rules in context cache
     prompt += f"# Current context (trust it)\nDate:{about.today}"
 
