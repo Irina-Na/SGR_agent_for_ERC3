@@ -7,7 +7,7 @@ Runtime security gate for ERC3 agents. Given a free-form user request (`user_que
 
 Current layout
 --------------
-- `agent_security_analyser/security_checker.py`: core classification logic (rule-based and LLM-based).
+- `agent_security_analyser/security_checker.py`: core LLM-backed classification logic.
 - `agent_security_analyser/debug_failed_tasks.py`: helper to replay/classify known bad cases and log LLM decisions.
 - `agent_security_analyser/policy/plan-ideal-manual/policies.json`: hand-curated policy bundle shipped with the repo (default for LLM mode).
 
@@ -20,14 +20,10 @@ How security_checker works
 --------------------------
 `security_checker.py` exposes:
 - `Decision`: dataclass with `status: allow|deny|clarify` and `reason` code.
-- `load_policy_constraints(path)`: loads `constraints_map` from a policies file. Expects a dict keyed by `user_query` with constraint objects.
-- `classify(user_query, user_ctx, resource_ctx, policy, allow_on_missing=False, on_missing=None)`: deterministic, rule-based classifier.
-  - Input `policy` can be the full `policies.json` payload or a pre-extracted `constraints_map`.
-  - Constraint fields honored (all optional; default is deny if missing):
-    - `roles` (allowed roles), `override_roles` (can bypass responsibility), `locations` (or `["any"]`), `allow_if_exec` (exec override), `needs_responsibility`, `needs_assignment`, `needs_clarification`, `sensitivity` (`public|internal|sensitive|highly_sensitive`).
-  - Resolution order: fetch constraint by `user_query`; if missing -> `on_missing` callback else `allow_on_missing` else deny; then check role, location, responsibility, assignment, sensitivity, clarification; return `Decision`.
+- `load_policy_constraints(path)`: loads `constraints_map` from a policies file (dict keyed by `user_query`).
+- `classify(...)`: legacy alias to `llm_classify`; all decisions go through the LLM (rule-based path removed).
 - `llm_classify(user_query, user_ctx, resource_ctx, policy_path=DEFAULT_POLICY_PATH, model=env OPENAI_MODEL or gpt-4o-mini)`: LLM-backed classifier.
-  - Builds a strict system prompt with the matching constraint and relevant rules from `policies.json` and asks the model to return JSON matching `LlmDecision` schema.
+  - Builds a strict system prompt with the matching constraint and relevant rules from `policies.json` (or a passed policy dict) and asks the model to return JSON matching `LlmDecision` schema.
   - On parse failure, returns `Decision("deny", "llm_parse_error")`.
 
 Data inputs
@@ -38,14 +34,13 @@ Data inputs
 Runtime usage example
 ---------------------
 ```python
-from agent_security_analyser.security_checker import classify, load_policy_constraints
+from agent_security_analyser.security_checker import llm_classify
 
-constraints_map = load_policy_constraints("agent_security_analyser/policy/plan-ideal-manual/policies.json")
-decision = classify(
+decision = llm_classify(
     user_query="salary_view",
     user_ctx={"user_id": "alice", "role": "level_3", "location": "Munich"},
     resource_ctx={"project_location": "Munich", "is_owner_or_lead": False, "user_on_project": False, "target_resolved": True},
-    policy=constraints_map,
+    model="gpt-4.1",
 )
 print(decision.status, decision.reason)
 ```
@@ -93,4 +88,5 @@ If you need to regenerate the tasks JSON from an ERC3 session (read-only), omit 
 Notes
 -----
 - `policy_planner.py` and `dynamic_policy.py` are legacy/unused for policy delivery in the current flow.
+- Rule-based classification has been removed; only the LLM path remains (via `llm_classify` or its `classify` alias).
 - Ensure `.env` is present when relying on LLM classification; otherwise set `OPENAI_API_KEY` in the environment. 

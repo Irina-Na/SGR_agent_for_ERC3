@@ -11,5 +11,5 @@ context_*
 **/policy/**
 
 *.json
-
+*.md
 **/found_data/**

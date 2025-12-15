@@ -1,15 +1,14 @@
 """
-Runtime security checker: applies policy constraints to a given user_query/user/resource.
+Runtime security checker: LLM-based policy gate for a given user_query/user/resource.
 
-Use `policy_planner.py` at startup to fetch wiki, build a plan, and extract policies.
-Then feed the extracted constraints (from policies.json) into `classify` for each request.
+Use `policy_planner.py` at startup to fetch wiki, build a plan, and extract policies;
+route runtime checks through `llm_classify` (or its `classify` alias).
 """
 from __future__ import annotations
 
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Literal, Sequence
 
@@ -30,10 +29,11 @@ class Decision:
     reason: str
 
 
-def load_policy_constraints(policy_path: Path) -> Dict[str, Dict[str, Any]]:
-    """Load constraints map keyed by user_query from a saved policies.json."""
-    data = json.loads(Path(policy_path).read_text(encoding="utf-8"))
-    raw = data.get("constraints_map") or data.get("constraints") or {}
+def _extract_constraints_map(policy: dict | Dict[str, Dict[str, Any]] | None) -> Dict[str, Dict[str, Any]]:
+    """Normalize constraints map from a full policy dict or already-extracted map."""
+    if not isinstance(policy, dict):
+        return {}
+    raw = policy.get("constraints_map") or policy.get("constraints") or policy
     if isinstance(raw, list):
         return {c.get("user_query"): c for c in raw if isinstance(c, dict) and c.get("user_query")}
     if isinstance(raw, dict):
@@ -41,71 +41,10 @@ def load_policy_constraints(policy_path: Path) -> Dict[str, Dict[str, Any]]:
     return {}
 
 
-def classify(
-    user_query: str,
-    user_ctx: dict,
-    resource_ctx: dict,
-    policy: dict | Dict[str, Dict[str, Any]],
-    allow_on_missing: bool = False,
-    on_missing=None,
-) -> Decision:
-    """
-    Apply fail-closed classification of a request using a normalized policy dict or a constraints_map.
-
-    Expected input (any of):
-      - full policy dict from policies.json (with constraints/constraints_map)
-      - already-extracted constraints_map { user_query: { ..fields.. } }
-
-    Constraint fields respected (all optional, default deny if missing):
-      roles, override_roles, locations (['any'] to disable check),
-      allow_if_exec, needs_responsibility, needs_assignment,
-      needs_clarification, sensitivity (public|internal|sensitive|highly_sensitive).
-    """
-    constraints_map: Dict[str, Dict[str, Any]] = {}
-    if isinstance(policy, dict):
-        raw = policy.get("constraints") or policy.get("constraints_map") or policy
-        if isinstance(raw, list):
-            constraints_map = {c.get("user_query"): c for c in raw if isinstance(c, dict) and c.get("user_query")}
-        elif isinstance(raw, dict):
-            constraints_map = {k: v for k, v in raw.items() if isinstance(v, dict)}
-    constraints = constraints_map.get(user_query)
-    if not constraints:
-        if on_missing:
-            return on_missing(user_query, user_ctx, resource_ctx)
-        if allow_on_missing:
-            return Decision("allow", f"policy_missing_allowed:{user_query}")
-        return Decision("deny", f"policy_no_rule_for_{user_query}")
-
-    role = user_ctx.get("role")
-    # Execs default to override unless explicitly disabled
-    exec_override = role == "exec" and constraints.get("allow_if_exec", True)
-
-    allowed_roles = constraints.get("roles", [])
-    if allowed_roles and not (exec_override or role in allowed_roles):
-        return Decision("deny", f"role_not_allowed:{role}")
-
-    allowed_locations = constraints.get("locations")
-    if allowed_locations and "any" not in allowed_locations and not exec_override:
-        locs = {resource_ctx.get("project_location"), user_ctx.get("location")}
-        if not any(loc in allowed_locations for loc in locs if loc):
-            return Decision("deny", "location_scope_block")
-
-    if constraints.get("needs_responsibility") and not exec_override:
-        if not resource_ctx.get("is_owner_or_lead", False) and role not in constraints.get("override_roles", []):
-            return Decision("deny", "not_responsible_for_project")
-
-    if constraints.get("needs_assignment") and not exec_override:
-        if not resource_ctx.get("user_on_project", False):
-            return Decision("deny", "not_assigned_to_project")
-
-    sensitivity = constraints.get("sensitivity")
-    if sensitivity in ("sensitive", "highly_sensitive") and not exec_override:
-        return Decision("deny", "sensitive_data_blocked")
-
-    if constraints.get("needs_clarification") and not resource_ctx.get("target_resolved"):
-        return Decision("clarify", "need_disambiguation")
-
-    return Decision("allow", "ok")
+def load_policy_constraints(policy_path: Path) -> Dict[str, Dict[str, Any]]:
+    """Load constraints map keyed by user_query from a saved policies.json."""
+    data = json.loads(Path(policy_path).read_text(encoding="utf-8"))
+    return _extract_constraints_map(data)
 
 
 DEFAULT_POLICY_PATH = Path("agent_security_analyser/policy/plan-ideal-manual/policies.json")
@@ -140,9 +79,9 @@ def _load_full_policy(policy_path: Path = DEFAULT_POLICY_PATH) -> dict:
 
 
 def _build_llm_messages(user_query: str, user_ctx: dict, resource_ctx: dict, policy_doc: dict) -> list[dict]:
-    constraints_map = load_policy_constraints(Path(DEFAULT_POLICY_PATH))
+    constraints_map = _extract_constraints_map(policy_doc)
     constraint = constraints_map.get(user_query, {})
-    policy_rules: Sequence[dict] = policy_doc.get("policies", [])
+    policy_rules: Sequence[dict] = policy_doc.get("policies", []) or []
     relevant_rules = [r for r in policy_rules if user_query in (r.get("user_queries") or [])]
 
     system = (
@@ -174,12 +113,13 @@ def llm_classify(
     user_ctx: dict,
     resource_ctx: dict,
     policy_path: Path = DEFAULT_POLICY_PATH,
+    policy_doc: dict | None = None,
     model: str | None = None,
 ) -> Decision:
     """LLM-based classifier using the ideal manual policies as context."""
     if OpenAI is None:
         raise ImportError("openai package not installed; LLM classification unavailable")
-    policy_doc = _load_full_policy(policy_path)
+    policy_doc = policy_doc or _load_full_policy(policy_path)
     messages = _build_llm_messages(user_query, user_ctx, resource_ctx, policy_doc)
     client = OpenAI()
     resp = client.chat.completions.create(
@@ -197,6 +137,29 @@ def llm_classify(
     except Exception:
         pass
     return Decision("deny", "llm_parse_error")
+
+
+def classify(
+    user_query: str,
+    user_ctx: dict,
+    resource_ctx: dict,
+    policy: dict | Dict[str, Dict[str, Any]] | Path | str | None = None,
+    allow_on_missing: bool = False,  # kept for API compatibility; ignored
+    on_missing=None,  # kept for API compatibility; ignored
+    model: str | None = None,
+) -> Decision:
+    """
+    Legacy alias that routes classification exclusively through llm_classify.
+
+    Any rule-based checks have been removed to avoid hard-coded outcomes; the
+    LLM now decides based on the provided policy document.
+    """
+    policy_doc = policy if isinstance(policy, dict) else None
+    if policy_doc is not None and "policies" not in policy_doc:
+        # Allow passing a bare constraints_map and still feed it to the LLM.
+        policy_doc = {"constraints_map": policy_doc}
+    policy_path = Path(policy) if isinstance(policy, (str, Path)) else DEFAULT_POLICY_PATH
+    return llm_classify(user_query, user_ctx, resource_ctx, policy_path=policy_path, policy_doc=policy_doc, model=model)
 
 
 __all__ = ["Decision", "classify", "load_policy_constraints", "llm_classify"]
