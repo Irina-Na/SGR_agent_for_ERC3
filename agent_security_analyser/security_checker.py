@@ -1,5 +1,5 @@
 """
-Runtime security checker: applies policy constraints to a given intent/user/resource.
+Runtime security checker: applies policy constraints to a given user_query/user/resource.
 
 Use `policy_planner.py` at startup to fetch wiki, build a plan, and extract policies.
 Then feed the extracted constraints (from policies.json) into `classify` for each request.
@@ -31,18 +31,18 @@ class Decision:
 
 
 def load_policy_constraints(policy_path: Path) -> Dict[str, Dict[str, Any]]:
-    """Load constraints map keyed by intent from a saved policies.json."""
+    """Load constraints map keyed by user_query from a saved policies.json."""
     data = json.loads(Path(policy_path).read_text(encoding="utf-8"))
     raw = data.get("constraints_map") or data.get("constraints") or {}
     if isinstance(raw, list):
-        return {c.get("intent"): c for c in raw if isinstance(c, dict) and c.get("intent")}
+        return {c.get("user_query"): c for c in raw if isinstance(c, dict) and c.get("user_query")}
     if isinstance(raw, dict):
         return {k: v for k, v in raw.items() if isinstance(v, dict)}
     return {}
 
 
 def classify(
-    intent: str,
+    user_query: str,
     user_ctx: dict,
     resource_ctx: dict,
     policy: dict | Dict[str, Dict[str, Any]],
@@ -54,7 +54,7 @@ def classify(
 
     Expected input (any of):
       - full policy dict from policies.json (with constraints/constraints_map)
-      - already-extracted constraints_map { intent: { ..fields.. } }
+      - already-extracted constraints_map { user_query: { ..fields.. } }
 
     Constraint fields respected (all optional, default deny if missing):
       roles, override_roles, locations (['any'] to disable check),
@@ -65,16 +65,16 @@ def classify(
     if isinstance(policy, dict):
         raw = policy.get("constraints") or policy.get("constraints_map") or policy
         if isinstance(raw, list):
-            constraints_map = {c.get("intent"): c for c in raw if isinstance(c, dict) and c.get("intent")}
+            constraints_map = {c.get("user_query"): c for c in raw if isinstance(c, dict) and c.get("user_query")}
         elif isinstance(raw, dict):
             constraints_map = {k: v for k, v in raw.items() if isinstance(v, dict)}
-    constraints = constraints_map.get(intent)
+    constraints = constraints_map.get(user_query)
     if not constraints:
         if on_missing:
-            return on_missing(intent, user_ctx, resource_ctx)
+            return on_missing(user_query, user_ctx, resource_ctx)
         if allow_on_missing:
-            return Decision("allow", f"policy_missing_allowed:{intent}")
-        return Decision("deny", f"policy_no_rule_for_{intent}")
+            return Decision("allow", f"policy_missing_allowed:{user_query}")
+        return Decision("deny", f"policy_no_rule_for_{user_query}")
 
     role = user_ctx.get("role")
     # Execs default to override unless explicitly disabled
@@ -139,11 +139,11 @@ def _load_full_policy(policy_path: Path = DEFAULT_POLICY_PATH) -> dict:
     return json.loads(Path(policy_path).read_text(encoding="utf-8"))
 
 
-def _build_llm_messages(intent: str, user_ctx: dict, resource_ctx: dict, policy_doc: dict) -> list[dict]:
+def _build_llm_messages(user_query: str, user_ctx: dict, resource_ctx: dict, policy_doc: dict) -> list[dict]:
     constraints_map = load_policy_constraints(Path(DEFAULT_POLICY_PATH))
-    constraint = constraints_map.get(intent, {})
+    constraint = constraints_map.get(user_query, {})
     policy_rules: Sequence[dict] = policy_doc.get("policies", [])
-    relevant_rules = [r for r in policy_rules if intent in (r.get("intents") or [])]
+    relevant_rules = [r for r in policy_rules if user_query in (r.get("user_queries") or [])]
 
     system = (
         "You are a strict security decision service. "
@@ -161,7 +161,7 @@ def _build_llm_messages(intent: str, user_ctx: dict, resource_ctx: dict, policy_
         ],
         "user_ctx": user_ctx,
         "resource_ctx": resource_ctx,
-        "request": intent,
+        "request": user_query,
     }
     return [
         {"role": "system", "content": system},
@@ -170,7 +170,7 @@ def _build_llm_messages(intent: str, user_ctx: dict, resource_ctx: dict, policy_
 
 
 def llm_classify(
-    intent: str,
+    user_query: str,
     user_ctx: dict,
     resource_ctx: dict,
     policy_path: Path = DEFAULT_POLICY_PATH,
@@ -180,7 +180,7 @@ def llm_classify(
     if OpenAI is None:
         raise ImportError("openai package not installed; LLM classification unavailable")
     policy_doc = _load_full_policy(policy_path)
-    messages = _build_llm_messages(intent, user_ctx, resource_ctx, policy_doc)
+    messages = _build_llm_messages(user_query, user_ctx, resource_ctx, policy_doc)
     client = OpenAI()
     resp = client.chat.completions.create(
         model=model or os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
