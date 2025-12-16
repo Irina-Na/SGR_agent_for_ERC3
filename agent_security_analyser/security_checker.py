@@ -79,33 +79,39 @@ def _load_full_policy(policy_path: Path = DEFAULT_POLICY_PATH) -> dict:
     return json.loads(Path(policy_path).read_text(encoding="utf-8"))
 
 
-def _load_employee_access_rules(entities_path: Path = DEFAULT_ENTITIES_PATH) -> list[dict]:
+def _load_security_and_rules(entities_path: Path = DEFAULT_ENTITIES_PATH) -> dict:
     """
-    Load employee_access_rules from the manual wiki entities file with basic validation.
-    Keeps a permissive fallback to [] if the file is missing or malformed.
+    Load security_and_rules from the manual wiki entities file with basic validation.
+    Keeps a permissive fallback to {} if the file is missing or malformed.
     """
-    try:
-        data = json.loads(Path(entities_path).read_text(encoding="utf-8"))
-        structured = data.get("security_structured") or {}
-        rules = structured.get("employee_access_rules") or []
-        return [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
-    except Exception:
-        return []
+    for path in (
+        Path(entities_path),
+        Path(entities_path).with_name(f"{Path(entities_path).stem}_copy{Path(entities_path).suffix}"),
+    ):
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            structured = data.get("security_structured") or {}
+            sec_rules = data.get("security_and_rules") or structured.get("security_and_rules") or {}
+            if isinstance(sec_rules, dict) and sec_rules:
+                return sec_rules
+        except Exception:
+            continue
+    return {}
 
 
 def _build_llm_messages(user_query: str, user_ctx: dict, resource_ctx: dict, policy_doc: dict | None) -> list[dict]:
-    employee_access_rules = _load_employee_access_rules()
+    security_and_rules = _load_security_and_rules()
 
     system = (
         "You are a strict security decision service. "
-        "Use ONLY the provided employee_access_rules plus the user_ctx and resource_ctx. "
+        "Use ONLY the provided security_and_rules plus the user_ctx and resource_ctx. "
         "If anything is missing or ambiguous, return deny. "
         "Output ONLY JSON matching the schema below; no prose. "
         "Schema:\n"
         f"{LlmDecision.schema_str()}"
     )
     user_payload = {
-        "employee_access_rules": employee_access_rules,
+        "security_and_rules": security_and_rules,
         "user_ctx": user_ctx,
         "resource_ctx": resource_ctx,
         "request": user_query,

@@ -125,7 +125,33 @@ class EmployeeAccessRule(BaseModel):
     actions_allowed: list[str] | None = Field(None, description="read, update, delete, etc.")
     actions_denied: list[str] | None = Field(None, description="update, write, search, etc.")
 
-#_____________Rules_v2______________
+#_____________Rules_v3______________
+
+class CompanyBlock(BaseModel):
+    found_id: str = ""
+    company_name: str = ""
+    company_role: str = ""
+    
+
+
+class Rules(BaseModel):   # security_and_rules
+    rules_type: Literal ["employee_rules", "guest_rules", "external_bot_access_rules", "internal_bot_access_rules"]
+    rules: list[SecurityRule]
+    
+
+class SecurityRule(BaseModel):
+    path_and_row: str = Field(..., description="Path to file and line number")
+    actors: List[str] = Field(default_factory=list, description="People/roles the rule applies to")
+    rule: str
+    data_action_scope: List[str] = Field(default_factory=list, description="Actions with data or resources referenced")
+    restrictions: List[str] = Field(default_factory=list, description="Allow/deny/conditions")
+
+
+#_____________Rules_v4______________
+class Rules(CompanyBlock):   # security_and_rules
+    rules: list[EmployeeAccessRule | ExternalBotAccessRule | InternalBotAccessRule]
+
+
 class AccessRules(BaseModel):
     actor_type: Literal ['employee', 'guest', 'bot']
     employee_name: str |None = Field(None, description="if actor_type is 'employee' - Name of person from wiki, else None")
@@ -135,13 +161,6 @@ class AccessRules(BaseModel):
     actions_denied: list[str] | None = Field(None, description="read, update, write, search, etc.")
     
     
-class SecurityRule(BaseModel):
-    path_and_row: str = Field(..., description="Path to file and line number")
-    rule: str
-    actors: List[str] = Field(default_factory=list, description="People/roles the rule applies to")
-    data_action_scope: List[str] = Field(default_factory=list, description="Data or resources referenced")
-    restrictions: List[str] = Field(default_factory=list, description="Allow/deny/conditions")
-
 
 class SecurityExtraction(CompanyBlock):
     rules: List[SecurityRule] = Field(default_factory=list)
