@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 from typing import Annotated, List, Union, Literal, Optional
 from annotated_types import MaxLen, MinLen, Gt, Lt
-from erc3.erc3 import ProjectDetail
 from pydantic import BaseModel, Field
 from erc3 import erc3 as dev, ApiException, TaskInfo, ERC3, Erc3Client
 from dotenv import load_dotenv
@@ -14,35 +13,16 @@ from langfuse import get_client
 lf = get_client()
 
 from tools import MyLLM
-
-# this is how you can add custom tools that work slightly better
-class Req_DeleteWikiPage(BaseModel):
-    tool: Literal["/wiki/delete"] = "/wiki/delete"
-    file: str
-    changed_by: Optional[dev.EmployeeID] = None
-
-class Req_ListAllProjectsForUser(BaseModel):
-    tool: Literal["/all-projects-for-user"] = "/all-projects-for-user"
-    user: dev.EmployeeID
-
-class Resp_ListAllProjectsForUser(BaseModel):
-    lead_in: List[ProjectDetail]
-    member_of: List[ProjectDetail]
-
-class Req_ListAllCustomersForUser(BaseModel):
-    tool: Literal["/all-customers-for-user"] = "/all-customers-for-user"
-    user: dev.EmployeeID
-
-class Resp_ListAllCustomersForUser(BaseModel):
-    customers: List[dev.CompanyDetail]
-
-# wrap this with more descriptive names to avoid confusing LLM
-class GetTimesheetReportByProject(dev.Req_TimeSummaryByProject):
-    pass
-class GetTimesheetReportByEmployee(dev.Req_TimeSummaryByEmployee):
-    pass
-class CreateTimesheetEntryForUser(dev.Req_LogTimeEntry):
-    pass
+from api_tools import (
+    Req_DeleteWikiPage,
+    Req_ListAllProjectsForUser,
+    Req_ListAllCustomersForUser,
+    GetTimesheetReportByProject,
+    CreateTimesheetEntryForUser,
+    Req_SearchProjectsEverywhere,
+    list_my_projects,
+    list_my_customers,
+)
 
 # next-step planner
 class NextStep(BaseModel):
@@ -57,6 +37,7 @@ class NextStep(BaseModel):
         dev.Req_ProvideAgentResponse,
         dev.Req_ListProjects,
         dev.Req_SearchProjects,
+        Req_SearchProjectsEverywhere,
         Req_ListAllProjectsForUser,
         dev.Req_GetProject,
         dev.Req_UpdateProjectTeam,
@@ -82,53 +63,6 @@ CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
 CLI_BLUE = "\x1B[34m"
 CLI_CLR = "\x1B[0m"
-
-# custom tool to list my projects
-def list_my_projects(api: Erc3Client, user: str) -> Resp_ListAllProjectsForUser:
-    page_limit = 32
-    next_offset = 0
-    lead_in = []
-    member_of = []
-    while True:
-        try:
-            prjs = api.search_projects(offset=next_offset, limit=page_limit, include_archived=True, team=dict(employee_id=user))
-
-            for p in prjs.projects or []:
-                detail = api.get_project(p.id).project
-                role = [t for t in detail.team if t.employee == user][0].role
-
-                if role == "Lead":
-                    lead_in.append(detail)
-                else:
-                    member_of.append(detail)
-
-            next_offset = prjs.next_offset
-            if next_offset == -1:
-                return Resp_ListAllProjectsForUser(lead_in=lead_in, member_of=member_of)
-        except ApiException as e:
-            if "page limit exceeded" in str(e):
-                page_limit /= 2
-                if page_limit <= 2:
-                    raise
-def list_my_customers(api: Erc3Client, user: str) -> Resp_ListAllCustomersForUser:
-    page_limit = 32
-    next_offset = 0
-    loaded = []
-    while True:
-        try:
-            custs = api.search_customers(offset=next_offset, limit=page_limit, account_managers=[user])
-
-            for p in custs.companies or []:
-                loaded.append(api.get_customer(p.id).company)
-
-            next_offset = custs.next_offset
-            if next_offset == -1:
-                return Resp_ListAllCustomersForUser(customers=loaded)
-        except ApiException as e:
-            if "page limit exceeded" in str(e):
-                page_limit /= 2
-                if page_limit <= 2:
-                    raise
 
 # Tool do automatically distill wiki rules
 def distill_rules(api: Erc3Client, llm: MyLLM, about: dev.Resp_WhoAmI) -> str:
@@ -276,6 +210,10 @@ def my_dispatch(client: Erc3Client, cmd: BaseModel, about: dev.Resp_WhoAmI):
 
     if isinstance(cmd, Req_ListAllCustomersForUser):
         return list_my_customers(client, cmd.user)
+
+    if isinstance(cmd, dev.Req_SearchProjects):
+        cmd.include_archived = True
+        return client.dispatch(cmd)
 
     if isinstance(cmd, dev.Req_ProvideAgentResponse):
         # drop link to current user

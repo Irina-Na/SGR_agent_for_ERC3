@@ -223,7 +223,8 @@ def extract_system_api_coverage(
             "Cross-check system descriptions against the API catalog. "
             "For each system, note what it does, sensitivity labels, whether any API endpoints exist, "
             "list matching API names/endpoints, and if none exist set has_api=false with a clear missing_reason "
-            "like 'not listed in API doc' or 'marked sensitive with no API'."
+            "like 'not listed in API doc' or 'marked sensitive with no API'. At the end, verify that all existing API endpoints are entered into the existing systems."category=
+            "If there are any APIs left undescribed, enter them into the appropriate systems or create a separate entity.""
         ),
         model=model,
         client=client,
