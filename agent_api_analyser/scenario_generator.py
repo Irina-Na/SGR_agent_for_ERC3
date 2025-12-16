@@ -4,6 +4,7 @@ from typing import Literal
 
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
+from agent_api_analyser.wiki_context import build_wiki_context
 
 
 class Argument(BaseModel):
@@ -34,8 +35,8 @@ class ScenarioGenerator:
 
     @staticmethod
     def load_docs(path: str | Path = "sgr-knowledge-agent-erc3_test/docs") -> str:
-        root = Path(path)
-        return "\n\n".join(p.read_text(encoding="utf-8") for p in sorted(root.rglob("*.md")))
+        # Prefer curated wiki context if index is present, otherwise fallback to raw docs concat.
+        return build_wiki_context(path)
 
     def generate(
         self, catalog: list, docs_text: str, kind: Literal["read", "write"] = "read"
