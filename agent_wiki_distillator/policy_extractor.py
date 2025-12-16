@@ -103,6 +103,7 @@ def distill_bundle(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     model: str | None = None,
     client: OpenAI | None = None,
+    wiki_sha: str | None = None,
 ) -> Path:
     found = _read_found(found_path)
     files = found.get("files") or {}
@@ -173,6 +174,7 @@ def distill_bundle(
 
     bundle = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "wiki_sha": wiki_sha,
         "found_path": str(_resolve_found(found_path)),
         "company": company.model_dump(),
         "rules": rules.model_dump(),
@@ -180,7 +182,8 @@ def distill_bundle(
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"wiki_policy_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    suffix = wiki_sha or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = output_dir / f"wiki_policy_{suffix}.json"
     out_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_path
 
@@ -199,3 +202,6 @@ def _cli() -> None:
 
 if __name__ == "__main__":
     _cli()
+
+# Backward compatibility
+distill_policy_bundle = distill_bundle

@@ -48,7 +48,7 @@ class NextStep(BaseModel):
     # if task is completed, model will pick ReportTaskCompletion
     first_step_from_plan: Union[
         dev.Req_ProvideAgentResponse,
-        dev.Req_ListProjects,
+        #dev.Req_ListProjects,
         dev.Req_SearchProjects,
         Req_ListAllProjectsForUser,
         dev.Req_GetProject,
@@ -58,7 +58,7 @@ class NextStep(BaseModel):
         dev.Req_SearchEmployees,
         dev.Req_GetEmployee,
         dev.Req_UpdateEmployeeInfo,
-        dev.Req_ListCustomers,
+        #dev.Req_ListCustomers,
         Req_ListAllCustomersForUser,
         dev.Req_GetCustomer,
         dev.Req_SearchCustomers,
