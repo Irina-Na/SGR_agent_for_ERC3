@@ -1,8 +1,8 @@
-from typing import List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 
 from erc3 import erc3 as dev, ApiException, Erc3Client
 from erc3.erc3 import ProjectDetail
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Custom tool declarations grouped for reuse across agents.
 
@@ -30,6 +30,23 @@ class Req_ListAllCustomersForUser(BaseModel):
 
 class Resp_ListAllCustomersForUser(BaseModel):
     customers: List[dev.CompanyDetail]
+
+
+class Req_RunSecurityCheck(BaseModel):
+    """Call the manual security checker before executing potentially sensitive steps."""
+    tool: Literal["/security/check"] = "/security/check"
+    request: str = Field(..., description="Describe the action or user request to evaluate")
+    # Pass optional JSON string (or omit) for user/resource context; dicts are also accepted server-side.
+    user_ctx: Optional[str] = None
+    resource_ctx: Optional[str] = None
+    model: Optional[str] = None
+
+
+class Resp_SecurityCheck(BaseModel):
+    status: Literal["allow", "deny", "clarify"]
+    reason: str
+    user_ctx: Dict[str, Any]
+    resource_ctx: Dict[str, Any]
 
 
 # Wrap stock tools with clearer names to avoid confusing the LLM.

@@ -99,8 +99,22 @@ def _load_security_and_rules(entities_path: Path = DEFAULT_ENTITIES_PATH) -> dic
     return {}
 
 
-def _build_llm_messages(user_query: str, user_ctx: dict, resource_ctx: dict, policy_doc: dict | None) -> list[dict]:
+def _to_dict_maybe_json(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _build_llm_messages(user_query: str, user_ctx: dict, resource_ctx: dict | str, policy_doc: dict | None) -> list[dict]:
     security_and_rules = _load_security_and_rules()
+    resource_ctx_dict = _to_dict_maybe_json(resource_ctx)
 
     system = (
         "You are a strict security decision service. "
@@ -113,7 +127,7 @@ def _build_llm_messages(user_query: str, user_ctx: dict, resource_ctx: dict, pol
     user_payload = {
         "security_and_rules": security_and_rules,
         "user_ctx": user_ctx,
-        "resource_ctx": resource_ctx,
+        "resource_ctx": resource_ctx_dict,
         "request": user_query,
     }
     return [
@@ -125,7 +139,7 @@ def _build_llm_messages(user_query: str, user_ctx: dict, resource_ctx: dict, pol
 def llm_classify(
     user_query: str,
     user_ctx: dict,
-    resource_ctx: dict,
+    resource_ctx: dict | str,
     policy_path: Path = DEFAULT_POLICY_PATH,
     policy_doc: dict | None = None,
     model: str | None = None,
@@ -156,7 +170,7 @@ def llm_classify(
 def classify(
     user_query: str,
     user_ctx: dict,
-    resource_ctx: dict,
+    resource_ctx: dict | str,
     policy: dict | Dict[str, Dict[str, Any]] | Path | str | None = None,
     allow_on_missing: bool = False,  # kept for API compatibility; ignored
     on_missing=None,  # kept for API compatibility; ignored

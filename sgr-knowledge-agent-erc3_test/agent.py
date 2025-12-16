@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from typing import Annotated, List, Union, Literal, Optional
 from annotated_types import MaxLen, MinLen, Gt, Lt
@@ -13,16 +14,22 @@ from langfuse import get_client
 lf = get_client()
 
 from tools import MyLLM
+root_dir = str(Path(__file__).resolve().parents[1])
+if root_dir not in sys.path:
+    sys.path.append(root_dir)
 from api_tools import (
     Req_DeleteWikiPage,
     Req_ListAllProjectsForUser,
     Req_ListAllCustomersForUser,
+    Req_RunSecurityCheck,
+    Resp_SecurityCheck,
     GetTimesheetReportByProject,
     CreateTimesheetEntryForUser,
     Req_SearchProjectsEverywhere,
     list_my_projects,
     list_my_customers,
 )
+from agent_security_analyser import security_checker
 
 # next-step planner
 class NextStep(BaseModel):
@@ -57,7 +64,8 @@ class NextStep(BaseModel):
         CreateTimesheetEntryForUser,
         dev.Req_UpdateTimeEntry,
         Req_DeleteWikiPage,
-    ] = Field(..., description="first step from plan above")
+        Req_RunSecurityCheck,
+    ] = Field(..., description="first step from plan above; use /security/check to validate sensitive steps")
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
@@ -71,23 +79,23 @@ def distill_rules(api: Erc3Client, llm: MyLLM, about: dev.Resp_WhoAmI) -> str:
 
     loc = Path(f"context_{context_id}_v2.json")
     fallback_loc = Path(__file__).resolve().parent / "context_733815c19ae7c1d13f345a2b2a9aa13c67a74769_v2.json"
-    manual_policy_json_path = Path(__file__).resolve().parents[1] / "agent_security_analyser" / "policy" / "manual_wiki_extracted_entities.json"
-    manual_policy_json_api_system = None
+    manual_policy_json_path = Path(__file__).resolve().parents[1] / "agent_security_analyser" / "policy" / "manual_wiki_extracted_entities_copy.json"
+    manual_policy_json_api_system_new_rules = None
     if manual_policy_json_path.exists():
         manual_policy_data = json.loads(manual_policy_json_path.read_text(encoding="utf-8"))
         security_structured = manual_policy_data.get("security_structured", {})
         collected_sections = {}
         for key, source in [
-            ("rules", security_structured.get("rules")),
+            ("role_levels", manual_policy_data.get("role_levels")),
             ("sensitivity_role_mandats", security_structured.get("sensitivity_role_mandats")),
             ("sensitivity_data_mandats", security_structured.get("sensitivity_data_mandats")),
             ("system_api_coverage", manual_policy_data.get("system_api_coverage")),
-            ("employee_access_rules", security_structured.get("employee_access_rules")),
+            ("security_and_rules", manual_policy_data.get("security_and_rules")),
         ]:
             if source is not None:
                 collected_sections[key] = source
         if collected_sections:
-            manual_policy_json_api_system = json.dumps(collected_sections, indent=2)
+            manual_policy_json_api_system_new_rules = json.dumps(collected_sections, indent=2)
 
     Category = Literal["applies_to_guests", "applies_to_users", "other"]
 
@@ -150,6 +158,7 @@ Company execs: {distilled.company_execs}
 Use available tools to execute task from the current user.
 
 - To confirm project access - get or find project (and get after finding)
+- When unsure about scope/sensitivity - run /security/check with the intended action and context
 - Archival of entries or wiki deletion are not irreversible operations.
 - Respond with proper Req_ProvideAgentResponse when:
     - Task is done
@@ -165,10 +174,11 @@ Use available tools to execute task from the current user.
     else:
         relevant_categories.append("applies_to_users")
 
-    if manual_policy_json_api_system:
-        prompt += f"\n\n# Wiki distillation (manual policies)\n{manual_policy_json_api_system}\n"
+    if manual_policy_json_api_system_new_rules:
+        prompt += f"\n\n# Wiki distillation (manual policies)\n{manual_policy_json_api_system_new_rules}\n"
+        prompt += "\n# Note\nAll security_and_rules are known to the security checker; access or deny can be clarified with them.\n"
     else:
-        raise FileNotFoundError(f"Expected distilled wiki rules at {manual_policy_json_path}")
+        raise FileNotFoundError(f"Expected distilled wiki rules at {manual_policy_json_api_system_new_rules}")
         '''for r in distilled.rules:
             if r.category in relevant_categories:
                 prompt += f"\n- {r.compact_rule}"
@@ -190,6 +200,7 @@ Use available tools to execute task from the current user.
 
 def my_dispatch(client: Erc3Client, cmd: BaseModel, about: dev.Resp_WhoAmI):
     # example how to add custom tools or tool handling
+    
     if isinstance(cmd, dev.Req_UpdateEmployeeInfo):
         # first pull
         cur = client.get_employee(cmd.employee).employee
@@ -219,7 +230,64 @@ def my_dispatch(client: Erc3Client, cmd: BaseModel, about: dev.Resp_WhoAmI):
         # drop link to current user
         cmd.links = [l for l in cmd.links if l.id != about.current_user]
         return client.dispatch(cmd)
+    
+    if isinstance(cmd, Req_RunSecurityCheck):
+        # Build user context programmatically from who_am_i + employee record (ignore LLM-provided user_ctx).
+        base_user_id = about.current_user or "guest"
+        base_location = about.location
+        role = "guest" if about.is_public else "level_3"
+        employee = None
+        if not about.is_public and about.current_user:
+            try:
+                employee = client.get_employee(about.current_user).employee
+                base_location = base_location or getattr(employee, "location", None)
+            except Exception:
+                employee = None
+        try:
+            data = json.loads(security_checker.DEFAULT_ENTITIES_PATH.read_text(encoding="utf-8"))
+            rules = data.get("security_structured", {}).get("employee_access_rules") or []
+            emp_name = getattr(employee, "name", None)
+            for r in rules:
+                if r.get("employee_name") == emp_name:
+                    lvl = (r.get("employee_level") or "").lower()
+                    if "level 1" in lvl:
+                        role = "level_1"
+                    elif "level 2" in lvl:
+                        role = "level_2"
+                    elif "level 3" in lvl:
+                        role = "level_3"
+                    break
+        except Exception:
+            pass
+        user_ctx = {"user_id": base_user_id, "role": role, "location": base_location}
+        user_ctx = {k: v for k, v in user_ctx.items() if v is not None}
 
+        # Allow resource_ctx as JSON string; default to dict.
+        raw_resource_ctx = cmd.resource_ctx
+        if isinstance(raw_resource_ctx, str):
+            try:
+                raw_resource_ctx = json.loads(raw_resource_ctx)
+            except Exception:
+                raw_resource_ctx = {}
+        resource_ctx = raw_resource_ctx if isinstance(raw_resource_ctx, dict) else {}
+        if about.location and "project_location" not in resource_ctx:
+            resource_ctx["project_location"] = about.location
+        resource_ctx.setdefault("target_resolved", False)
+        try:
+            decision = security_checker.llm_classify(cmd.request, user_ctx, resource_ctx, model=cmd.model)
+        except Exception as e:
+            return Resp_SecurityCheck(
+                status="deny",
+                reason=f"security_check_error:{e.__class__.__name__}",
+                user_ctx=user_ctx,
+                resource_ctx=resource_ctx,
+            )
+        return Resp_SecurityCheck(
+            status=decision.status,
+            reason=decision.reason,
+            user_ctx=user_ctx,
+            resource_ctx=resource_ctx,
+        )
     return client.dispatch(cmd)
 
 def run_agent(model: str, api: ERC3, task: TaskInfo, provider: Literal["nebius", "openai"]="nebius"):
