@@ -8,7 +8,7 @@ core = ERC3()
 # Use the actual OpenAI model id; the API rejects the prefixed variant.
 MODEL_ID = "gpt-4.1"
 PLATFORM = "openai"  # or "nebius"
-version='0.2.0'
+version='0.2.1'
 
 
 # Debugging a single task
@@ -21,8 +21,8 @@ version='0.2.0'
 res = core.start_session(
     benchmark="erc3-dev", #test",
     workspace="ira",
-    name=f"NextStep SGR ({MODEL_ID}) {version} + new_wiki_distillation+pipelined",
-    architecture="NextStep SGR Agent with OpenAI + new_wiki_distillation from ERC3 Samples ")
+    name=f"NextStep SGR ({MODEL_ID}) {version} + json_entities_wiki_distillation+pipelined",
+    architecture="NextStep SGR Agent with OpenAI + json_entities_wiki_distillation from ERC3 Samples ")
 
 status = core.session_status(res.session_id)
 print(f"Session has {len(status.tasks)} tasks")

@@ -137,10 +137,23 @@ def distill_rules(api: Erc3Client, llm: MyLLM, about: dev.Resp_WhoAmI) -> str:
 
     loc = Path(f"context_{context_id}_v2.json")
     fallback_loc = Path(__file__).resolve().parent / "context_733815c19ae7c1d13f345a2b2a9aa13c67a74769_v2.json"
-    manual_policy_path = Path(__file__).resolve().parents[1] / "agent_security_analyser" / "policy" / "plan-ideal-manual" / "policies.json"
-    manual_policy_text = None
-    if manual_policy_path.exists():
-        manual_policy_text = manual_policy_path.read_text(encoding="utf-8")
+    manual_policy_json_path = Path(__file__).resolve().parents[1] / "agent_security_analyser" / "policy" / "manual_wiki_extracted_entities.json"
+    manual_policy_json_api_system = None
+    if manual_policy_json_path.exists():
+        manual_policy_data = json.loads(manual_policy_json_path.read_text(encoding="utf-8"))
+        security_structured = manual_policy_data.get("security_structured", {})
+        collected_sections = {}
+        for key, source in [
+            ("rules", security_structured.get("rules")),
+            ("sensitivity_role_mandats", security_structured.get("sensitivity_role_mandats")),
+            ("sensitivity_data_mandats", security_structured.get("sensitivity_data_mandats")),
+            ("system_api_coverage", manual_policy_data.get("system_api_coverage")),
+            ("employee_access_rules", security_structured.get("employee_access_rules")),
+        ]:
+            if source is not None:
+                collected_sections[key] = source
+        if collected_sections:
+            manual_policy_json_api_system = json.dumps(collected_sections, indent=2)
 
     Category = Literal["applies_to_guests", "applies_to_users", "other"]
 
@@ -218,10 +231,10 @@ Use available tools to execute task from the current user.
     else:
         relevant_categories.append("applies_to_users")
 
-    if manual_policy_text:
-        prompt += f"\n\n# Wiki distillation (manual policies)\n{manual_policy_text}\n"
+    if manual_policy_json_api_system:
+        prompt += f"\n\n# Wiki distillation (manual policies)\n{manual_policy_json_api_system}\n"
     else:
-        raise FileNotFoundError(f"Expected distilled wiki at {manual_policy_text}")
+        raise FileNotFoundError(f"Expected distilled wiki rules at {manual_policy_json_path}")
         '''for r in distilled.rules:
             if r.category in relevant_categories:
                 prompt += f"\n- {r.compact_rule}"
