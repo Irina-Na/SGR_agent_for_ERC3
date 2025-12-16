@@ -24,23 +24,25 @@ class FilesCategories(BaseModel):
 class SensitivityLevels(BaseModel):   # security_and_rules
     existed_types_of_sensitivity: list[str]
 
-class RoleTypes(BaseModel):   # people_and_roles
-    existed_role_names: list[str] = Field(..., description="CEO, engineer, team lead etc.")
-    
 class RoleLevels(BaseModel):   # people_and_roles
     existed_levels_of_role_hierarchy: list[str] = Field(..., description="Lvl1, lvl2. etc")
-    
+
 class SystemTypes(BaseModel):  # "systems_and_data"
     mentioned_systems_names: list[str] = Field(..., description="CRM, DataBase1, etc.")
  
 class DataTypes(BaseModel):    # "systems_and_data" # apis
     mentioned_data_entities: list[str] = Field(..., description="emplyee skills, customer contacts, etc.")
 
-class LocationTypes(BaseModel):  # locations
-    existed_location_names: list[str] = Field(..., description="Toronto, New York, etc.")
+class Location(BaseModel):  # locations
+    company_location: str
+    specification: str 
 
+'''
 class ActionTypes(BaseModel):   # security_and_rules # apis
     mentioned_possible_actions: list[str] = Field(..., description="read, update, write, search, etc.")
+    
+class RoleTypes(BaseModel):   # people_and_roles
+    existed_role_names: list[str] = Field(..., description="CEO, engineer, team lead etc.")
 
 #_____Rules_1_______
 class CompanyBlock(BaseModel):
@@ -124,29 +126,39 @@ class EmployeeAccessRule(BaseModel):
     resorces_name: str = ""
     actions_allowed: list[str] | None = Field(None, description="read, update, delete, etc.")
     actions_denied: list[str] | None = Field(None, description="update, write, search, etc.")
-
+    
+class RoleLevelsEmployees(BaseModel):
+    level: Literal [RoleLevels.existed_levels_of_role_hierarchy.values]
+    employees: list[str] = Field(..., description="Names of employees with this level")
+'''
 #_____________Rules_v3______________
 
-class CompanyBlock(BaseModel):
-    found_id: str = ""
-    company_name: str = ""
-    company_role: str = ""
-    
 
 
-class Rules(BaseModel):   # security_and_rules
-    rules_type: Literal ["employee_rules", "guest_rules", "external_bot_access_rules", "internal_bot_access_rules"]
-    rules: list[SecurityRule]
-    
+Category = Literal["applies_to_guests", "applies_to_users", "other"]
 
 class SecurityRule(BaseModel):
     path_and_row: str = Field(..., description="Path to file and line number")
     actors: List[str] = Field(default_factory=list, description="People/roles the rule applies to")
     rule: str
+    category: Category
     data_action_scope: List[str] = Field(default_factory=list, description="Actions with data or resources referenced")
     restrictions: List[str] = Field(default_factory=list, description="Allow/deny/conditions")
 
+class CompanyBlock(BaseModel):
+    found_id: str = ""
+    company_name: str = ""
+    company_role: str = ""
+    company_locations: list[Location]
 
+
+
+class Rules(CompanyBlock):   # security_and_rules
+    company_employee_hierarhy: list[RoleLevels]
+    rules_type: Literal ["employee_rules", "guest_rules", "external_bot_access_rules", "internal_bot_access_rules"]
+    rules: list[SecurityRule]
+    
+'''
 #_____________Rules_v4______________
 class Rules(CompanyBlock):   # security_and_rules
     rules: list[EmployeeAccessRule | ExternalBotAccessRule | InternalBotAccessRule]
@@ -190,7 +202,6 @@ class PersonEntry(BaseModel):
 class PeopleExtraction(CompanyBlock):
     people: List[PersonEntry] = Field(default_factory=list)
 
-'''
 class SystemEntry(BaseModel):
     path: str
     name: str
@@ -222,21 +233,21 @@ class SystemCapability(BaseModel):
     description: str = Field(..., description="What the system does in the company context")
     sensitivity: str  
     has_api: bool = Field(..., description="True if the API catalog lists endpoints for this system")
-    matched_apis: List[Apies] = Field(default_factory=list, description="API's that serve this system")
+    matched_apis: list[str] = Field(default_factory=list, description="API's that serve this system")
     missing_reason: str = Field(default="", description="Why the API is unavailable or not listed")
 
 class Apies(BaseModel):
     api_name: str
     purpose: str
         
-class SystemApiCoverageExtraction(BaseModel):
+class SystemApiCoverageExtraction(CompanyBlock):
     systems: List[SystemCapability] = Field(default_factory=list)
     
     
     
     
 #_____Rules_v0_generated_________________
-
+'''
 
 class CompanyBlock(BaseModel):
     found_id: str = ""
@@ -305,3 +316,4 @@ class ApiEntry(BaseModel):
 
 class ApisExtraction(CompanyBlock):
     apis: List[ApiEntry] = Field(default_factory=list)
+'''

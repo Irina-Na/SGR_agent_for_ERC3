@@ -1,4 +1,7 @@
+import hashlib
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Annotated, List, Union, Literal, Optional
@@ -17,6 +20,7 @@ from tools import MyLLM
 root_dir = str(Path(__file__).resolve().parents[1])
 if root_dir not in sys.path:
     sys.path.append(root_dir)
+from agent_wiki_distillator import policy_extractor, wiki_annotator
 from api_tools import (
     Req_DeleteWikiPage,
     Req_ListAllProjectsForUser,
@@ -72,30 +76,127 @@ CLI_GREEN = "\x1B[32m"
 CLI_BLUE = "\x1B[34m"
 CLI_CLR = "\x1B[0m"
 
+DOCS_ROOT = Path(__file__).resolve().parent / "docs"
+FETCH_SCRIPT = Path(__file__).resolve().parent / "fetch_wiki.py"
+DISTILL_CACHE_DIR = Path(__file__).resolve().parent / "extracted_data"
+DISTILL_CACHE_META = DISTILL_CACHE_DIR / "distill_cache.json"
+WIKI_INDEX_PATH = DOCS_ROOT / "wiki_index.json"
+
+
+def _ensure_wiki_docs() -> None:
+    if DOCS_ROOT.exists() and any(DOCS_ROOT.iterdir()):
+        return
+    DOCS_ROOT.mkdir(parents=True, exist_ok=True)
+    subprocess.run([sys.executable, str(FETCH_SCRIPT)], check=True)
+
+
+def _ensure_wiki_index() -> dict:
+    if WIKI_INDEX_PATH.exists():
+        return json.loads(WIKI_INDEX_PATH.read_text(encoding="utf-8"))
+    _ensure_wiki_docs()
+    try:
+        subprocess.run([sys.executable, str(FETCH_SCRIPT)], check=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"fetch_wiki failed: {exc}")
+    if WIKI_INDEX_PATH.exists():
+        return json.loads(WIKI_INDEX_PATH.read_text(encoding="utf-8"))
+    return {}
+
+
+def _wiki_sha(index: dict) -> str:
+    sha = index.get("tree_sha1") or index.get("sha1") or ""
+    if sha:
+        return sha
+    pieces = [f.get("sha1", "") for f in index.get("files", []) if isinstance(f, dict) and f.get("sha1")]
+    if not pieces:
+        return ""
+    return hashlib.sha1("|".join(pieces).encode("utf-8")).hexdigest()
+
+
+def _load_distill_cache() -> dict:
+    if DISTILL_CACHE_META.exists():
+        try:
+            return json.loads(DISTILL_CACHE_META.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_distill_cache(meta: dict) -> None:
+    DISTILL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    DISTILL_CACHE_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ensure_policy_bundle(model: str, wiki_sha_hint: str | None = None) -> Path:
+    """
+    Ensure wiki is present locally, then distill policy bundle with wiki_annotator + policy_extractor.
+    Re-runs distillation when wiki sha changes.
+    """
+    _ensure_wiki_docs()
+    index = _ensure_wiki_index()
+    wiki_sha = _wiki_sha(index)
+    if wiki_sha_hint and wiki_sha_hint != wiki_sha:
+        try:
+            subprocess.run([sys.executable, str(FETCH_SCRIPT)], check=True)
+            index = _ensure_wiki_index()
+            wiki_sha = _wiki_sha(index)
+        except Exception as exc:  # noqa: BLE001
+            print(f"fetch_wiki on sha mismatch failed: {exc}")
+
+    cache = _load_distill_cache()
+    cached_path = Path(cache["policy_path"]) if cache.get("policy_path") else None
+    if cache.get("wiki_sha") == wiki_sha and cached_path and cached_path.exists():
+        return cached_path
+
+    found, found_path = wiki_annotator.find_categories(
+        model=model,
+        index_path=WIKI_INDEX_PATH,
+        docs_root=DOCS_ROOT,
+        fetch_script=FETCH_SCRIPT,
+    )
+    bundle_path = policy_extractor.distill_policy_bundle(
+        found_path=found_path,
+        docs_root=DOCS_ROOT,
+        output_dir=DISTILL_CACHE_DIR,
+        wiki_sha=wiki_sha,
+        model=model,
+    )
+    _save_distill_cache(
+        {
+            "wiki_sha": wiki_sha,
+            "found_path": str(found_path),
+            "policy_path": str(bundle_path),
+        }
+    )
+    return bundle_path
+
 # Tool do automatically distill wiki rules
 def distill_rules(api: Erc3Client, llm: MyLLM, about: dev.Resp_WhoAmI) -> str:
 
-    context_id = about.wiki_sha1
+    model_name = os.environ.get("OPENAI_MODEL", llm.model)
 
+    policy_payload: dict = {}
+    policy_path: Path | None = None
+    try:
+        policy_path = ensure_policy_bundle(model_name, about.wiki_sha1)
+        policy_payload = json.loads(Path(policy_path).read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"policy distillation failed, trying fallback: {exc}")
+        fallback_policy = Path(__file__).resolve().parents[1] / "agent_security_analyser" / "policy" / "manual_wiki_extracted_entities_copy.json"
+        if fallback_policy.exists():
+            policy_path = fallback_policy
+            policy_payload = json.loads(fallback_policy.read_text(encoding="utf-8"))
+
+    if policy_path and policy_path.exists():
+        security_checker.DEFAULT_ENTITIES_PATH = policy_path
+        try:
+            security_checker._load_security_and_rules.__defaults__ = (policy_path,)
+        except Exception:
+            pass
+
+    context_id = about.wiki_sha1
     loc = Path(f"context_{context_id}_v2.json")
     fallback_loc = Path(__file__).resolve().parent / "context_733815c19ae7c1d13f345a2b2a9aa13c67a74769_v2.json"
-    manual_policy_json_path = Path(__file__).resolve().parents[1] / "agent_security_analyser" / "policy" / "manual_wiki_extracted_entities_copy.json"
-    manual_policy_json_api_system_new_rules = None
-    if manual_policy_json_path.exists():
-        manual_policy_data = json.loads(manual_policy_json_path.read_text(encoding="utf-8"))
-        security_structured = manual_policy_data.get("security_structured", {})
-        collected_sections = {}
-        for key, source in [
-            ("role_levels", manual_policy_data.get("role_levels")),
-            ("sensitivity_role_mandats", security_structured.get("sensitivity_role_mandats")),
-            ("sensitivity_data_mandats", security_structured.get("sensitivity_data_mandats")),
-            ("system_api_coverage", manual_policy_data.get("system_api_coverage")),
-            ("security_and_rules", manual_policy_data.get("security_and_rules")),
-        ]:
-            if source is not None:
-                collected_sections[key] = source
-        if collected_sections:
-            manual_policy_json_api_system_new_rules = json.dumps(collected_sections, indent=2)
 
     Category = Literal["applies_to_guests", "applies_to_users", "other"]
 
@@ -110,50 +211,78 @@ def distill_rules(api: Erc3Client, llm: MyLLM, about: dev.Resp_WhoAmI) -> str:
         company_execs: List[str]
         rules: List[Rule]
 
-    if not loc.exists():
-        if fallback_loc.exists():
-            loc = fallback_loc
-            '''
-        print("New context discovered. Distilling rules once")
-        schema = json.dumps(NextStep.model_json_schema())
-        prompt = f"""
-Carefully review the wiki below and identify most important security/scoping/data rules that will be highly relevant for the agent or user that are automating APIs of this company.
-
-Pay attention to the rules that mention AI Agent or Public ChatBot. When talking about Public Chatbot use - applies_to_guests
-
-Rules must be compact RFC-style, ok to use pseudo code for compactness. They will be used by an agent that operates following APIs: {schema}
-""".strip()
-
-        for path in api.list_wiki().paths:
-            content = api.load_wiki(path)
-            prompt += f"\n---- start of {path} ----\n\n{content}\n\n ---- end of {path} ----\n"
-
-
-        messages = [{ "role": "system", "content": prompt}]
-
-        # Persist only the parsed structure expected by DistillWikiRules.
-        distilled = llm.query(messages, DistillWikiRules)
-        distilled = distilled.choices[0].message.parsed
-
-        loc.write_text(distilled.model_dump_json(indent=2), encoding="utf-8")
-            '''
-        else:
-            raise FileNotFoundError(f"Expected distilled wiki cache at {loc}")
-    raw_cache = json.loads(loc.read_text(encoding="utf-8"))
-    if isinstance(raw_cache, dict) and "parsed" in raw_cache:
-        distilled = DistillWikiRules.model_validate(raw_cache["parsed"])
-    elif isinstance(raw_cache, dict) and isinstance(raw_cache.get("content"), str):
+    distilled_cache: DistillWikiRules | None = None
+    for cand in (loc, fallback_loc):
+        if not cand.exists():
+            continue
         try:
-            distilled = DistillWikiRules.model_validate_json(raw_cache["content"])
+            raw_cache = json.loads(cand.read_text(encoding="utf-8"))
+            if isinstance(raw_cache, dict) and "parsed" in raw_cache:
+                distilled_cache = DistillWikiRules.model_validate(raw_cache["parsed"])
+            elif isinstance(raw_cache, dict) and isinstance(raw_cache.get("content"), str):
+                distilled_cache = DistillWikiRules.model_validate_json(raw_cache["content"])
+            else:
+                distilled_cache = DistillWikiRules.model_validate(raw_cache)
+            break
         except Exception:
-            distilled = DistillWikiRules.model_validate(raw_cache)
-    else:
-        distilled = DistillWikiRules.model_validate(raw_cache)
+            continue
 
-    prompt = f"""You are AI Chatbot automating {distilled.company_name}.
+    company_section = policy_payload.get("company") or policy_payload
+    company_name = (
+        company_section.get("company_name")
+        or policy_payload.get("company_name")
+        or getattr(distilled_cache, "company_name", "the company")
+    )
+    raw_locations = (
+        company_section.get("company_locations")
+        or policy_payload.get("company_locations")
+        or getattr(distilled_cache, "company_locations", [])
+    )
+    company_locations = []
+    for loc in raw_locations or []:
+        if isinstance(loc, str):
+            company_locations.append(loc)
+        elif isinstance(loc, dict):
+            val = loc.get("company_location") or loc.get("location")
+            if val:
+                company_locations.append(val)
+    company_execs = getattr(distilled_cache, "company_execs", [])
+
+    role_levels = policy_payload.get("role_levels") or []
+    security_structured = policy_payload.get("security_structured") or {}
+    system_api_coverage = policy_payload.get("system_api_coverage") or {}
+
+    raw_rules_section = policy_payload.get("rules") or policy_payload.get("security_and_rules") or {}
+    raw_rules = raw_rules_section.get("rules") if isinstance(raw_rules_section, dict) else raw_rules_section
+    relevant_categories: List[str] = ["other", "applies_to_guests" if about.is_public else "applies_to_users"]
+    filtered_rules = []
+    if isinstance(raw_rules, list):
+        for r in raw_rules:
+            if not isinstance(r, dict):
+                continue
+            cat = r.get("category")
+            if cat and cat not in relevant_categories:
+                continue
+            filtered_rules.append(r)
+    security_and_rules = {"rules": filtered_rules} if filtered_rules else {"rules": raw_rules or []}
+
+    policy_block = {
+        "company_name": company_name,
+        "company_locations": company_locations,
+        "role_levels": role_levels,
+        "security_structured": security_structured,
+        "security_and_rules": security_and_rules,
+        "system_api_coverage": system_api_coverage,
+    }
+    manual_policy_json_api_system_new_rules = json.dumps(policy_block, indent=2)
+
+    prompt = f"""You are AI Chatbot automating {company_name}.
     
-Company locations: {distilled.company_locations}
-Company execs: {distilled.company_execs}
+Company locations: {company_locations}"""
+    if company_execs:
+        prompt += f"\nCompany execs: {company_execs}"
+
+    prompt += """
 
 Use available tools to execute task from the current user.
 
@@ -165,24 +294,10 @@ Use available tools to execute task from the current user.
     - Task can't be completed (e.g. internal error, user is not allowed or clarification is needed)
 - Make sure to always include ids of referenced entities in response links.
 - if user might have access to a resource - double-chech that BEFORE denying
-
-# Rules
 """
-    relevant_categories: List[Category] = ["other"]
-    if about.is_public:
-        relevant_categories.append("applies_to_guests")
-    else:
-        relevant_categories.append("applies_to_users")
 
-    if manual_policy_json_api_system_new_rules:
-        prompt += f"\n\n# Wiki distillation (manual policies)\n{manual_policy_json_api_system_new_rules}\n"
-        prompt += "\n# Note\nAll security_and_rules are known to the security checker; access or deny can be clarified with them.\n"
-    else:
-        raise FileNotFoundError(f"Expected distilled wiki rules at {manual_policy_json_api_system_new_rules}")
-        '''for r in distilled.rules:
-            if r.category in relevant_categories:
-                prompt += f"\n- {r.compact_rule}"
-        '''
+    prompt += f"\n\n# Wiki distillation\n{manual_policy_json_api_system_new_rules}\n"
+    prompt += "\n# Note\nAll security_and_rules are known to the security checker; access or deny can be clarified with them.\n"
     # append at the end to keep rules in context cache
     prompt += f"# Current context (trust it)\nDate:{about.today}"
 

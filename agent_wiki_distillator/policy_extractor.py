@@ -1,36 +1,27 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
-import argparse
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
 from agent_wiki_distillator.data_models import (
-    ApisExtraction,
     CompanyBlock,
-    LocationsExtraction,
-    PeopleExtraction,
-    SecurityExtraction,
+    Rules,
     SystemApiCoverageExtraction,
-    SystemsExtraction,
 )
 
 load_dotenv()
 
 DEFAULT_DOCS_ROOT = Path("sgr-knowledge-agent-erc3_test/docs")
-DEFAULT_FOUND_PATH = Path("agent_wiki_distillator/found_data/found-20251215T153124Z/found.json")
-FOUND_ROOT = Path("agent_wiki_extraction/found_data")
-APIS_DEFAULT_PATH = DEFAULT_DOCS_ROOT / "prep_desc.md"
-
-
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+DEFAULT_FOUND_ROOT = Path("agent_wiki_distillator/found_data")
+DEFAULT_OUTPUT_DIR = Path("sgr-knowledge-agent-erc3_test/extracted_data")
 
 
 def _client(cli: OpenAI | None = None) -> OpenAI:
@@ -42,265 +33,168 @@ def _client(cli: OpenAI | None = None) -> OpenAI:
     return OpenAI(api_key=key)
 
 
-def _load_found(found_path: Path) -> dict:
-    if not found_path.exists():
-        raise FileNotFoundError(found_path)
-    return json.loads(found_path.read_text(encoding="utf-8"))
+def _resolve_found(found_path: Path | None) -> Path:
+    if found_path and Path(found_path).exists():
+        return Path(found_path)
+    candidates = sorted(DEFAULT_FOUND_ROOT.glob("found-*/found.json"), reverse=True)
+    if candidates:
+        return candidates[0]
+    raise FileNotFoundError("found.json not found; run wiki_annotator first.")
 
 
-def _meta(found: dict) -> CompanyBlock:
-    return CompanyBlock(
-        found_id=found.get("found_id") or "",
-        company_name=found.get("company_name") or "",
-        company_role=found.get("company_role") or "",
-    )
+def _read_found(found_path: Path | None) -> dict:
+    resolved = _resolve_found(found_path)
+    return json.loads(resolved.read_text(encoding="utf-8"))
 
 
-def _read_files(paths: List[str], docs_root: Path) -> List[dict]:
+def _read_docs(paths: List[str], docs_root: Path) -> List[dict]:
     docs: List[dict] = []
     for p in paths:
-        p_obj = Path(p)
-        candidates = [p_obj]
-        if not p_obj.is_absolute():
-            candidates.insert(0, docs_root / p_obj)
-
-        full: Path | None = None
-        for cand in candidates:
-            if cand.exists():
-                full = cand
-                break
-        if not full:
+        path = docs_root / p if not Path(p).is_absolute() else Path(p)
+        if not path.exists():
             continue
-
         try:
-            rel = full.relative_to(docs_root)
-            path_label = str(rel)
+            rel = path.relative_to(docs_root)
+            label = str(rel)
         except ValueError:
-            path_label = str(full)
-
-        docs.append({"path": path_label, "content": full.read_text(encoding="utf-8")})
+            label = str(path)
+        docs.append({"path": label, "content": path.read_text(encoding="utf-8")})
     return docs
-
-
-def _save(category: str, payload: BaseModel, root: Path = FOUND_ROOT) -> Path:
-    root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{category}-{_ts()}.json"
-    path.write_text(payload.model_dump_json(indent=2, ensure_ascii=False), encoding="utf-8")
-    return path
 
 
 def _call_llm(
     category: str,
     schema: type[BaseModel],
     files: List[str],
-    company: CompanyBlock,
     docs_root: Path,
+    company_name: str,
+    company_role: str,
     system_hint: str,
     model: str,
     client: OpenAI | None = None,
+    base_payload: dict | None = None,
 ) -> BaseModel:
-    cli = _client(client)
-    docs = _read_files(files, docs_root)
+    docs = _read_docs(files, docs_root)
     if not docs:
-        return schema(**company.model_dump())
+        return schema(**(base_payload or {}))  # type: ignore[arg-type]
 
     sys_prompt = (
-        f"You extract '{category}' facts for {company.company_name} ({company.company_role}). "
-        "Use only provided wiki files. Respond strictly in JSON matching the schema."
+        f"Extract '{category}' for {company_name} ({company_role}). "
+        "Use only provided wiki content. Reply strictly as JSON schema."
     )
     if system_hint:
         sys_prompt += f" {system_hint}"
 
-    user_payload = {"company": company.model_dump(), "files": docs}
-    resp = cli.beta.chat.completions.parse(
+    payload = {"company_name": company_name, "company_role": company_role, "files": docs}
+    resp = _client(client).beta.chat.completions.parse(
         model=model,
         messages=[
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
         response_format=schema,
     )
     return resp.choices[0].message.parsed
 
 
-def extract_security_and_rules(
-    files: List[str],
-    model: str = "gpt-4.1",
+def distill_bundle(
+    found_path: Path | None = None,
     docs_root: Path = DEFAULT_DOCS_ROOT,
-    found_path: Path = DEFAULT_FOUND_PATH,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    model: str | None = None,
     client: OpenAI | None = None,
 ) -> Path:
-    found = _load_found(found_path)
-    company = _meta(found)
-    result: SecurityExtraction = _call_llm(
-        "security_and_rules",
-        SecurityExtraction,
-        files,
-        company,
+    found = _read_found(found_path)
+    files = found.get("files") or {}
+    company_name = found.get("company_name", "")
+    company_role = found.get("company_role", "")
+    model_id = model or os.environ.get("OPENAI_MODEL", "gpt-4.1")
+
+    base = {
+        "found_id": found.get("found_id", ""),
+        "company_name": company_name,
+        "company_role": company_role,
+        "company_locations": [],
+    }
+
+    company_files: List[str] = []
+    if "locations" in files:
+        company_files.extend(files["locations"])
+    readme = docs_root / "README.md"
+    if readme.exists():
+        company_files.append(str(readme))
+    company = _call_llm(
+        "company_profile",
+        CompanyBlock,
+        company_files,
         docs_root,
-        system_hint="Capture actors, allowed or denied actions, data scope, and conditions per rule.",
-        model=model,
-        client=client,
+        company_name,
+        company_role,
+        "Return company_name, company_role, and company_locations (list of objects with company_location, specification).",
+        model_id,
+        client,
+        base_payload=base,
     )
-    result.found_id = result.found_id or company.found_id
-    result.company_name = result.company_name or company.company_name
-    result.company_role = result.company_role or company.company_role
-    return _save("security_and_rules", result)
 
-
-def extract_locations(
-    files: List[str],
-    model: str = "gpt-4.1",
-    docs_root: Path = DEFAULT_DOCS_ROOT,
-    found_path: Path = DEFAULT_FOUND_PATH,
-    client: OpenAI | None = None,
-) -> Path:
-    found = _load_found(found_path)
-    company = _meta(found)
-    result: LocationsExtraction = _call_llm(
-        "locations",
-        LocationsExtraction,
-        files,
-        company,
+    rules_files = list(
+        dict.fromkeys(
+            (files.get("security_rules") or [])
+            + (files.get("access_levels") or [])
+            + (files.get("security_rules_and_access_levels") or [])
+            + (files.get("security_and_rules") or [])
+        )
+    )
+    rules = _call_llm(
+        "security_rules_and_access_levels",
+        Rules,
+        rules_files,
         docs_root,
-        system_hint="List offices/locations with address, city/region, and local contacts if stated.",
-        model=model,
-        client=client,
+        company_name,
+        company_role,
+        "Capture actors, allowed/denied actions, scope, and conditions per rule. Each SecurityRule must include category.",
+        model_id,
+        client,
+        base_payload=base,
     )
-    result.found_id = result.found_id or company.found_id
-    result.company_name = result.company_name or company.company_name
-    result.company_role = result.company_role or company.company_role
-    return _save("locations", result)
 
-
-def extract_people_and_roles(
-    files: List[str],
-    model: str = "gpt-4.1",
-    docs_root: Path = DEFAULT_DOCS_ROOT,
-    found_path: Path = DEFAULT_FOUND_PATH,
-    client: OpenAI | None = None,
-) -> Path:
-    found = _load_found(found_path)
-    company = _meta(found)
-    result: PeopleExtraction = _call_llm(
-        "people_and_roles",
-        PeopleExtraction,
-        files,
-        company,
-        docs_root,
-        system_hint="Extract people, titles, reporting lines, and key responsibilities.",
-        model=model,
-        client=client,
-    )
-    result.found_id = result.found_id or company.found_id
-    result.company_name = result.company_name or company.company_name
-    result.company_role = result.company_role or company.company_role
-    return _save("people_and_roles", result)
-
-
-def extract_system_api_coverage(
-    files: List[str],
-    model: str = "gpt-4.1",
-    docs_root: Path = DEFAULT_DOCS_ROOT,
-    found_path: Path = DEFAULT_FOUND_PATH,
-    client: OpenAI | None = None,
-) -> Path:
-    """
-    Build an inventory of systems and whether an API exists for each.
-    Combines system descriptions with the API catalog to flag unsupported tools.
-    """
-    found = _load_found(found_path)
-    company = _meta(found)
-    api_doc = str(APIS_DEFAULT_PATH)
-    combined_files = list(dict.fromkeys([*files, api_doc]))
-    result: SystemApiCoverageExtraction = _call_llm(
+    coverage_files = list(dict.fromkeys((files.get("systems_and_data") or []) + (files.get("apis") or [])))
+    coverage = _call_llm(
         "system_api_coverage",
         SystemApiCoverageExtraction,
-        combined_files,
-        company,
+        coverage_files,
         docs_root,
-        system_hint=(
-            "Cross-check system descriptions against the API catalog. "
-            "For each system, note what it does, sensitivity labels, whether any API endpoints exist, "
-            "list matching API names/endpoints, and if none exist set has_api=false with a clear missing_reason "
-            "like 'not listed in API doc' or 'marked sensitive with no API'. At the end, verify that all existing API endpoints are entered into the existing systems."category=
-            "If there are any APIs left undescribed, enter them into the appropriate systems or create a separate entity.""
-        ),
-        model=model,
-        client=client,
+        company_name,
+        company_role,
+        "Match systems with APIs; if no API set has_api=false with missing_reason.",
+        model_id,
+        client,
+        base_payload=base,
     )
-    result.found_id = result.found_id or company.found_id
-    result.company_name = result.company_name or company.company_name
-    result.company_role = result.company_role or company.company_role
-    return _save("system_api_coverage", result)
 
-
-def extract_all(
-    model: str = "gpt-4.1",
-    docs_root: Path = DEFAULT_DOCS_ROOT,
-    found_path: Path = DEFAULT_FOUND_PATH,
-    client: OpenAI | None = None,
-) -> dict[str, Path]:
-    found = _load_found(found_path)
-    files = found.get("files") or {}
-    return {
-        "security_and_rules": extract_security_and_rules(files.get("security_and_rules", []), model, docs_root, found_path, client),
-        "locations": extract_locations(files.get("locations", []), model, docs_root, found_path, client),
-        "people_and_roles": extract_people_and_roles(files.get("people_and_roles", []), model, docs_root, found_path, client),
-        "systems_and_data": extract_systems_and_data(files.get("systems_and_data", []), model, docs_root, found_path, client),
-        "apis": extract_apis(files.get("apis", []), model, docs_root, found_path, client),
-        "system_api_coverage": extract_system_api_coverage([*files.get("systems_and_data", []), str(APIS_DEFAULT_PATH)], model, docs_root, found_path, client),
+    bundle = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "found_path": str(_resolve_found(found_path)),
+        "company": company.model_dump(),
+        "rules": rules.model_dump(),
+        "system_api_coverage": coverage.model_dump(),
     }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"wiki_policy_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    out_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path
 
 
 def _cli() -> None:
-    """
-    Minimal CLI: first arg is optional category, defaults to all.
-    Usage:
-      python policy_extractor.py              # all categories
-      python policy_extractor.py apis         # one category
-      python policy_extractor.py system_api_coverage  # systems vs API coverage
-    """
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("category", nargs="?", default="all")
-    parser.add_argument("path", nargs="?", help="Optional path for apis category")
-    args, _unknown = parser.parse_known_args()
-
-    category = args.category
-    category_map = {
-        "security_and_rules": extract_security_and_rules,
-        "locations": extract_locations,
-        "people_and_roles": extract_people_and_roles,
-        "systems_and_data": extract_systems_and_data,
-        "apis": extract_apis,
-        "system_api_coverage": extract_system_api_coverage,
-    }
-
-    model = os.environ.get("OPENAI_MODEL", "gpt-4.1")
-
-    if category == "all":
-        paths = extract_all(model=model, docs_root=DEFAULT_DOCS_ROOT, found_path=DEFAULT_FOUND_PATH)
-        print(json.dumps({k: str(v) for k, v in paths.items()}, ensure_ascii=False, indent=2))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("category", nargs="?", default="bundle")
+    parser.add_argument("found", nargs="?", help="Path to found.json")
+    args = parser.parse_args()
+    if args.category != "bundle":
+        print("Only bundle mode is supported; run without args.")
         return
-
-    if category not in category_map:
-        print(f"Unknown category: {category}. Use one of: all, {', '.join(category_map)}")
-        return
-
-    if category == "apis":
-        custom_path = args.path or str(APIS_DEFAULT_PATH)
-        files = [custom_path]
-    elif category == "system_api_coverage":
-        found = _load_found(DEFAULT_FOUND_PATH)
-        system_files = (found.get("files") or {}).get("systems_and_data", [])
-        api_path = args.path or str(APIS_DEFAULT_PATH)
-        files = [*system_files, api_path]
-    else:
-        found = _load_found(DEFAULT_FOUND_PATH)
-        files = (found.get("files") or {}).get(category, [])
-
-    path = category_map[category](files=files, model=model, docs_root=DEFAULT_DOCS_ROOT, found_path=DEFAULT_FOUND_PATH)
-    print(str(path))
+    path = distill_bundle(found_path=Path(args.found) if args.found else None)
+    print(path)
 
 
 if __name__ == "__main__":

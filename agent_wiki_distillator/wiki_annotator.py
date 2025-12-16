@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-
 DEFAULT_INDEX = Path("sgr-knowledge-agent-erc3_test/docs/wiki_index.json")
 DEFAULT_DOCS_ROOT = Path("sgr-knowledge-agent-erc3_test/docs")
 DEFAULT_FETCH_SCRIPT = Path("sgr-knowledge-agent-erc3_test/fetch_wiki.py")
@@ -22,11 +21,13 @@ load_dotenv()
 
 
 class CategoryHits(BaseModel):
-    security_and_rules: List[str] = Field(default_factory=list, description="Policies, rulebooks, access guardrails")
+    security_rules: List[str] = Field(default_factory=list, description="Policies, rulebooks, access guardrails")
+    access_levels: List[str] = Field(default_factory=list, description="Company hierarchy, access levels for roles")
     locations: List[str] = Field(default_factory=list, description="Offices, locations, regional rules")
     people_and_roles: List[str] = Field(default_factory=list, description="Specific employees and their responsibilities")
     systems_and_data: List[str] = Field(default_factory=list, description="Internal systems, data sets, storage")
     apis: List[str] = Field(default_factory=list, description="Available or documented APIs")
+
 
 class WikiDiscovery(BaseModel):
     company_name: str | None = Field(default=None, description="Company name if stated in README")
@@ -34,6 +35,7 @@ class WikiDiscovery(BaseModel):
     files: CategoryHits
     what_can_be_find_in_wiki: str
     what_information_is_missing_from_the_wiki: str
+
 
 def _unique_id(prefix: str = "found") -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
