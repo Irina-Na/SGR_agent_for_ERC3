@@ -5,7 +5,7 @@ from typing import List, Type, TypeVar, Literal
 from dotenv import load_dotenv
 from erc3 import ERC3, TaskInfo
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Load environment variables for API keys
 load_dotenv()
@@ -24,7 +24,24 @@ nebius_client = OpenAI(base_url=NEBIUS_API_BASE, api_key=NEBIUS_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
-# resource_ctx: данные по проекту/ресурсу — project_location, is_owner_or_lead, user_on_project, target_resolved
+class QueryEntities(BaseModel):
+    employees: List[str] | None = Field(default=None, description="Employee names or ids mentioned in the query")
+    systems: List[str] | None = Field(default=None, description="Internal systems referenced (CRM, time tracker, wiki, dependency tracker, etc.)")
+    projects: List[str] | None = Field(default=None, description="Project names or ids mentioned in the query")
+    customers: List[str] | None = Field(default=None, description="Customer/company names mentioned in the query")
+    actions: List[str] | None = Field(default=None, description="Requested actions as short verbs (list, search, update, delete, log time)")
+
+
+QUERY_EXPANSION_PROMPT = (
+    "Extract the entities explicitly mentioned in the user's request. "
+    "Populate the following lists when the data is present: employees (names or ids), "
+    "systems (e.g. CRM, time tracking, wiki, dependency tracker), projects, customers, "
+    "and actions. Actions should be normalized verbs such as list, search, view, create, "
+    "update, delete, archive, log_time. If a category is not referenced, return null for it. "
+    "Do not invent entities that are not in the request."
+)
+
+# resource_ctx: project_location, is_owner_or_lead, user_on_project, target_resolved
 
 def get_llm_client(provider: Literal["nebius", "openai"], model_id: str) -> tuple[OpenAI, str]:
     """Return OpenAI-compatible client and model name for logging."""
@@ -94,3 +111,41 @@ class MyLLM:
         )
 
         return resp
+
+
+    @observe(as_type="generation", name="query_expansion")
+    def query_expansion(self, query: str) -> QueryEntities:
+        """Call LLM to extract structured entities from a free-form user query."""
+        messages = [
+            {"role": "system", "content": QUERY_EXPANSION_PROMPT},
+            {"role": "user", "content": query},
+        ]
+
+        client, _ = get_llm_client(self.provider, self.model)
+
+
+        def _clean(items: List[str] | None) -> List[str] | None:
+            if not items:
+                return None
+            cleaned = [i.strip() for i in items if isinstance(i, str) and i.strip()]
+            return cleaned or None
+
+        try:
+            resp = client.beta.chat.completions.parse(
+                messages=messages,
+                model=self.model,
+                response_format=QueryEntities,
+                temperature=0,
+            )
+            parsed = resp.choices[0].message.parsed
+            return QueryEntities(
+                employees=_clean(parsed.employees),
+                systems=_clean(parsed.systems),
+                projects=_clean(parsed.projects),
+                customers=_clean(parsed.customers),
+                actions=_clean(parsed.actions),
+            )
+        except Exception as e:
+            print(f"query_expansion failed: {e}")
+            # Lightweight fallback: return empty entities to keep downstream code running.
+            return QueryEntities()
