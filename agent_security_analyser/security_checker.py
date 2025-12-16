@@ -10,7 +10,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Literal, Sequence
+from typing import Any, Dict, Literal
 
 try:
     from openai import OpenAI
@@ -48,6 +48,7 @@ def load_policy_constraints(policy_path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 DEFAULT_POLICY_PATH = Path("agent_security_analyser/policy/plan-ideal-manual/policies.json")
+DEFAULT_ENTITIES_PATH = Path("agent_security_analyser/policy/manual_wiki_extracted_entities.json")
 DEFAULT_FAILURES_PATH = Path("agent_security_analyser/plans/security_policy_failures.json")
 DATA_ROOT = Path("agent_security_analyser/data")
 # who_am_i placeholder; replace with real call if available.
@@ -78,26 +79,33 @@ def _load_full_policy(policy_path: Path = DEFAULT_POLICY_PATH) -> dict:
     return json.loads(Path(policy_path).read_text(encoding="utf-8"))
 
 
-def _build_llm_messages(user_query: str, user_ctx: dict, resource_ctx: dict, policy_doc: dict) -> list[dict]:
-    constraints_map = _extract_constraints_map(policy_doc)
-    constraint = constraints_map.get(user_query, {})
-    policy_rules: Sequence[dict] = policy_doc.get("policies", []) or []
-    relevant_rules = [r for r in policy_rules if user_query in (r.get("user_queries") or [])]
+def _load_employee_access_rules(entities_path: Path = DEFAULT_ENTITIES_PATH) -> list[dict]:
+    """
+    Load employee_access_rules from the manual wiki entities file with basic validation.
+    Keeps a permissive fallback to [] if the file is missing or malformed.
+    """
+    try:
+        data = json.loads(Path(entities_path).read_text(encoding="utf-8"))
+        structured = data.get("security_structured") or {}
+        rules = structured.get("employee_access_rules") or []
+        return [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
+    except Exception:
+        return []
+
+
+def _build_llm_messages(user_query: str, user_ctx: dict, resource_ctx: dict, policy_doc: dict | None) -> list[dict]:
+    employee_access_rules = _load_employee_access_rules()
 
     system = (
         "You are a strict security decision service. "
-        "Use ONLY the provided constraint and relevant_rules. "
+        "Use ONLY the provided employee_access_rules plus the user_ctx and resource_ctx. "
         "If anything is missing or ambiguous, return deny. "
         "Output ONLY JSON matching the schema below; no prose. "
         "Schema:\n"
         f"{LlmDecision.schema_str()}"
     )
     user_payload = {
-        "constraint": constraint,
-        "relevant_rules": [
-            {"name": r.get("name"), "summary": r.get("summary"), "allow": r.get("allow"), "deny": r.get("deny")}
-            for r in relevant_rules
-        ],
+        "employee_access_rules": employee_access_rules,
         "user_ctx": user_ctx,
         "resource_ctx": resource_ctx,
         "request": user_query,
@@ -116,14 +124,14 @@ def llm_classify(
     policy_doc: dict | None = None,
     model: str | None = None,
 ) -> Decision:
-    """LLM-based classifier using the ideal manual policies as context."""
+    """LLM-based classifier using the manual employee access rules as context."""
     if OpenAI is None:
         raise ImportError("openai package not installed; LLM classification unavailable")
     policy_doc = policy_doc or _load_full_policy(policy_path)
     messages = _build_llm_messages(user_query, user_ctx, resource_ctx, policy_doc)
     client = OpenAI()
     resp = client.chat.completions.create(
-        model=model or os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        model=model or os.getenv("OPENAI_MODEL", "gpt-4.1"),
         messages=messages,
         temperature=0,
     )
