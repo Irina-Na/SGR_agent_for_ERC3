@@ -9,7 +9,10 @@ core = ERC3()
 MODEL_ID = "gpt-4.1"
 PLATFORM = "openai"  # or "nebius"
 version='0.3.1'
+BENCHMARK = "erc3-test"  # set once to keep fetch_wiki in sync
 
+os.environ.setdefault("ERC3_BENCHMARK", BENCHMARK)
+os.environ.setdefault("ERC3_WORKSPACE", "ira")
 
 # Debugging a single task
 # task = core.start_new_task("erc3-test", "project_check_by_member")
@@ -19,8 +22,8 @@ version='0.3.1'
 
 # Start session with metadata
 res = core.start_session(
-    benchmark="erc3-dev", #test",
-    workspace="ira",
+    benchmark=BENCHMARK, #test",
+    workspace=os.environ["ERC3_WORKSPACE"],
     name=f"NextStep SGR ({MODEL_ID}) {version} + json_entities_wiki_distillation+pipelined",
     architecture="NextStep SGR Agent from ERC3 Samples with OpenAI + json_entities_wiki_distillation+api_system_match+fix_unmatched_apis+new_rules extractor+security_checker as tool+adds wrapped_apis ")
 
@@ -42,7 +45,6 @@ for task in status.tasks:
         print(f"\nSCORE: {result.eval.score}\n{explain}\n")
 
 core.submit_session(res.session_id)
-
 
 
 
