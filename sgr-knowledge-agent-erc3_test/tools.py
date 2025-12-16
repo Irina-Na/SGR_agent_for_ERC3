@@ -30,14 +30,15 @@ class QueryEntities(BaseModel):
     projects: List[str] | None = Field(default=None, description="Project names or ids mentioned in the query")
     customers: List[str] | None = Field(default=None, description="Customer/company names mentioned in the query")
     actions: List[str] | None = Field(default=None, description="Requested actions as short verbs (list, search, update, delete, log time)")
-
+    required_resources: str = Field(..., description="Concise list or phrase of resources needed to fulfill the request")
 
 QUERY_EXPANSION_PROMPT = (
     "Extract the entities explicitly mentioned in the user's request. "
     "Populate the following lists when the data is present: employees (names or ids), "
     "systems (e.g. CRM, time tracking, wiki, dependency tracker), projects, customers, "
     "and actions. Actions should be normalized verbs such as list, search, view, create, "
-    "update, delete, archive, log_time. If a category is not referenced, return null for it. "
+    "update, delete, archive, log_time. Also provide required_resources: a concise phrase of what resources are needed to fulfill the request."
+    "If a category is not referenced, return null for it. "
     "Do not invent entities that are not in the request."
 )
 
@@ -144,8 +145,9 @@ class MyLLM:
                 projects=_clean(parsed.projects),
                 customers=_clean(parsed.customers),
                 actions=_clean(parsed.actions),
+                required_resources=parsed.required_resources,
             )
         except Exception as e:
             print(f"query_expansion failed: {e}")
             # Lightweight fallback: return empty entities to keep downstream code running.
-            return QueryEntities()
+            return QueryEntities(required_resources="")

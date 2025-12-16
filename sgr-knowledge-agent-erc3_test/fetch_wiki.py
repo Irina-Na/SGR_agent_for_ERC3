@@ -84,8 +84,8 @@ def main() -> None:
 
     # Start a short-lived session to access the wiki APIs.
     core = ERC3()
-    benchmark = os.getenv("ERC3_BENCHMARK", "erc3-dev")
-    workspace = os.getenv("ERC3_WORKSPACE", "local")
+    benchmark = os.getenv("ERC3_BENCHMARK", "erc3-test")
+    workspace = os.getenv("ERC3_WORKSPACE", "ira")
     session = core.start_session(
         benchmark=benchmark,
         workspace=workspace,

@@ -298,8 +298,14 @@ Use available tools to execute task from the current user.
 
     prompt += f"\n\n# Wiki distillation\n{manual_policy_json_api_system_new_rules}\n"
     prompt += "\n# Note\nAll security_and_rules are known to the security checker; access or deny can be clarified with them.\n"
-    # append at the end to keep rules in context cache
-    prompt += f"# Current context (trust it)\nDate:{about.today}"
+
+    context_block = {
+        "current_user_id": about.current_user,
+        "location": about.location,
+        "department": getattr(about, "department", None),
+    }
+    cleaned_context = {k: v for k, v in context_block.items() if v not in (None, "", [])}
+    prompt += f"# Current context (trust it)\nToday date:{about.today}\nUser asked bot:{json.dumps(cleaned_context, ensure_ascii=False)}"
 
     if about.is_public:
         prompt += "\nCurrent actor is GUEST (Anonymous user)"
@@ -308,7 +314,7 @@ Use available tools to execute task from the current user.
         employee.skills = []
         employee.wills = []
         dump = employee.model_dump_json()
-        prompt += f"\n# Current actor is authenticated user: {employee.name}:\n{dump}"
+        prompt += f"\n# Current actor is authenticated user. Got data about user_id by employee api: {employee.name}:\n{dump}"
 
     return prompt
 
@@ -388,6 +394,8 @@ def my_dispatch(client: Erc3Client, cmd: BaseModel, about: dev.Resp_WhoAmI):
         if about.location and "project_location" not in resource_ctx:
             resource_ctx["project_location"] = about.location
         resource_ctx.setdefault("target_resolved", False)
+        if last_query_entities and getattr(last_query_entities, "required_resources", None):
+            resource_ctx.setdefault("required_resources", last_query_entities.required_resources)
         try:
             decision = security_checker.llm_classify(cmd.request, user_ctx, resource_ctx, model=cmd.model)
         except Exception as e:
@@ -410,6 +418,7 @@ def run_agent(model: str, api: ERC3, task: TaskInfo, provider: Literal["nebius",
 
         erc_client = api.get_erc_client(task)
         about = erc_client.who_am_i()
+        last_query_entities = None
         
         llm = MyLLM(api=api, model=model, task=task, max_tokens=32768, provider=provider)
 
@@ -424,10 +433,16 @@ def run_agent(model: str, api: ERC3, task: TaskInfo, provider: Literal["nebius",
             outcome_confidence_1_to_5: Annotated[int, Gt(0), Lt(6)]
 
         # log will contain conversation context for the agent within task
-        log = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Request: '{task.task_text}'"},
-        ]
+        log = [{"role": "system", "content": system_prompt},
+               {"role": "user", "content": f"Request: '{task.task_text}'"}
+               ]
+
+        try:
+            expanded = llm.query_expansion(task.task_text)
+            last_query_entities = expanded
+            log.append({"role": "assistant", "content": f"Query entities: {expanded.model_dump_json(exclude_none=True)}"})
+        except Exception as e:
+            print(f"query_expansion failed: {e}")
 
         preflight_check = llm.query(log, RequestPreflightCheck).choices[0].message.parsed
         confidence = preflight_check.outcome_confidence_1_to_5

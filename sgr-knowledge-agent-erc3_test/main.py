@@ -1,8 +1,9 @@
 import textwrap
+import time
 
 from agent import run_agent
-from erc3 import ERC3
-
+from erc3 import ERC3, ApiException
+import os
 
 core = ERC3()
 # Use the actual OpenAI model id; the API rejects the prefixed variant.
@@ -30,6 +31,21 @@ res = core.start_session(
 status = core.session_status(res.session_id)
 print(f"Session has {len(status.tasks)} tasks")
 
+def _complete_with_retry(api: ERC3, task, attempts: int = 3, delay: float = 1.5):
+    for i in range(1, attempts + 1):
+        try:
+            return api.complete_task(task)
+        except ApiException as e:
+            print(f"complete_task failed (attempt {i}/{attempts}): {e}")
+            if i == attempts:
+                raise
+            time.sleep(delay)
+        except Exception as e:
+            print(f"complete_task unexpected error (attempt {i}/{attempts}): {e}")
+            if i == attempts:
+                raise
+            time.sleep(delay)
+
 for task in status.tasks:
     print("="*40)
     print(f"Starting Task: {task.task_id} ({task.spec_id}): {task.task_text}")
@@ -39,13 +55,12 @@ for task in status.tasks:
         run_agent(MODEL_ID, core, task, provider=PLATFORM)
     except Exception as e:
         print(e)
-    result = core.complete_task(task)
+    result = _complete_with_retry(core, task)
     if result.eval:
         explain = textwrap.indent(result.eval.logs, "  ")
         print(f"\nSCORE: {result.eval.score}\n{explain}\n")
 
 core.submit_session(res.session_id)
-
 
 
 
