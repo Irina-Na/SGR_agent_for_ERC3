@@ -61,12 +61,13 @@ class SensitivityRoleMandat(BaseModel): # security_and_rules
     max_sensitivity_level_allowed: Literal [SensitivityLevels.existing_types_of_sensitivity.values]
     
 class SensitivityDataMandat(BaseModel): # security_and_rules
-    data_entity: Literal [DataTypes.mentioned_data_entities.values]
     sensitivity_level: Literal [SensitivityLevels.existing_types_of_sensitivity.values]
-    
+    data_entities: list[Literal [DataTypes.mentioned_data_entities.values]]
+
 class SensitivitySystemMandat(BaseModel): # security_and_rules
-    system: Literal [SystemTypes.mentioned_systems_names.values]
     sensitivity_level: Literal [SensitivityLevels.existing_types_of_sensitivity.values]
+    systems: list[Literal [SystemTypes.mentioned_systems_names.values]]
+
     
 class EmployeeAccessRule(BaseModel): # security_and_rules
     type: Literal ["employee_access_rules"]
@@ -95,15 +96,45 @@ class CompanyBlock(BaseModel):
     found_id: str = ""
     company_name: str = ""
     company_role: str = ""
+    
+class Rules(CompanyBlock):   # security_and_rules
+    rules: list[EmployeeAccessRule | ExternalBotAccessRule | InternalBotAccessRule]
 
+
+class Rule(BaseModel):   # security_and_rules
+    type: Literal ["employee_access_rules", "external_bot_access_rules", "internal_bot_access_rules"]
+    rule: AccessRules
+    
+class SensitivityRoleMandat(BaseModel): # security_and_rules
+    role_level: Literal [RoleLevels.existed_levels_of_role_hierarchy.values]
+    max_sensitivity_level_allowed: Literal [SensitivityLevels.existing_types_of_sensitivity.values]
+    
+class SensitivityDataMandat(BaseModel): # security_and_rules
+    sensitivity_level: Literal [SensitivityLevels.existing_types_of_sensitivity.values]
+    data_entities: list[Literal [DataTypes.mentioned_data_entities.values]]
+
+class SensitivitySystemMandat(BaseModel): # security_and_rules
+    sensitivity_level: Literal [SensitivityLevels.existing_types_of_sensitivity.values]
+    systems: list[Literal [SystemTypes.mentioned_systems_names.values]]
+
+
+class EmployeeAccessRule(BaseModel):
+    employee_name: str 
+    employee_level: Literal [RoleLevels.existed_levels_of_role_hierarchy.values]
+    resorces_name: str = ""
+    actions_allowed: list[str] | None = Field(None, description="read, update, delete, etc.")
+    actions_denied: list[str] | None = Field(None, description="update, write, search, etc.")
+
+#_____________Rules_v2______________
 class AccessRules(BaseModel):
-    actor: str = ""
-    resorce_type: Literal ["system_acess", "data_acess"]
+    actor_type: Literal ['employee', 'guest', 'bot']
+    employee_name: str |None = Field(None, description="if actor_type is 'employee' - Name of person from wiki, else None")
+    employee_level: Literal [RoleLevels.existed_levels_of_role_hierarchy.values]
     resorce_name: str = ""
-    action_allowed: str | None
-    action_denied: str | None
-
-
+    actions_allowed: list[str] | None = Field(None, description="read, update, write, search, etc.")
+    actions_denied: list[str] | None = Field(None, description="read, update, write, search, etc.")
+    
+    
 class SecurityRule(BaseModel):
     path_and_row: str = Field(..., description="Path to file and line number")
     rule: str
@@ -140,7 +171,7 @@ class PersonEntry(BaseModel):
 class PeopleExtraction(CompanyBlock):
     people: List[PersonEntry] = Field(default_factory=list)
 
-
+'''
 class SystemEntry(BaseModel):
     path: str
     name: str
@@ -155,8 +186,7 @@ class SystemsExtraction(CompanyBlock):
 
 
 class ApiEntry(BaseModel):
-    path: str
-    name: str
+    api_name: str
     purpose: str
     endpoints: List[str] = Field(default_factory=list)
     auth: str | None = None
@@ -165,6 +195,23 @@ class ApiEntry(BaseModel):
 
 class ApisExtraction(CompanyBlock):
     apis: List[ApiEntry] = Field(default_factory=list)
+'''
+
+class SystemCapability(BaseModel):
+    path_and_row: str = Field(..., description="Sourse file for system description and line number")
+    system: str = Field(..., description="Name of the system or tool")
+    description: str = Field(..., description="What the system does in the company context")
+    sensitivity: str  
+    has_api: bool = Field(..., description="True if the API catalog lists endpoints for this system")
+    matched_apis: List[Apies] = Field(default_factory=list, description="API's that serve this system")
+    missing_reason: str = Field(default="", description="Why the API is unavailable or not listed")
+
+class Apies(BaseModel):
+    api_name: str
+    purpose: str
+        
+class SystemApiCoverageExtraction(BaseModel):
+    systems: List[SystemCapability] = Field(default_factory=list)
     
     
     
@@ -216,7 +263,7 @@ class PeopleExtraction(CompanyBlock):
 
 
 class SystemEntry(BaseModel):
-    path: str
+    path_row: str
     name: str
     description: str
     data_assets: List[str] = Field(default_factory=list)

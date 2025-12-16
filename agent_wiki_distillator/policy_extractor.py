@@ -10,6 +10,15 @@ import argparse
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, Field
+from agent_wiki_distillator.data_models import (
+    ApisExtraction,
+    CompanyBlock,
+    LocationsExtraction,
+    PeopleExtraction,
+    SecurityExtraction,
+    SystemApiCoverageExtraction,
+    SystemsExtraction,
+)
 
 load_dotenv()
 
@@ -189,54 +198,40 @@ def extract_people_and_roles(
     return _save("people_and_roles", result)
 
 
-def extract_systems_and_data(
+def extract_system_api_coverage(
     files: List[str],
     model: str = "gpt-4.1",
     docs_root: Path = DEFAULT_DOCS_ROOT,
     found_path: Path = DEFAULT_FOUND_PATH,
     client: OpenAI | None = None,
 ) -> Path:
+    """
+    Build an inventory of systems and whether an API exists for each.
+    Combines system descriptions with the API catalog to flag unsupported tools.
+    """
     found = _load_found(found_path)
     company = _meta(found)
-    result: SystemsExtraction = _call_llm(
-        "systems_and_data",
-        SystemsExtraction,
-        files,
+    api_doc = str(APIS_DEFAULT_PATH)
+    combined_files = list(dict.fromkeys([*files, api_doc]))
+    result: SystemApiCoverageExtraction = _call_llm(
+        "system_api_coverage",
+        SystemApiCoverageExtraction,
+        combined_files,
         company,
         docs_root,
-        system_hint="Summarize internal systems, stored data assets, sensitivity markers, and integrations.",
+        system_hint=(
+            "Cross-check system descriptions against the API catalog. "
+            "For each system, note what it does, sensitivity labels, whether any API endpoints exist, "
+            "list matching API names/endpoints, and if none exist set has_api=false with a clear missing_reason "
+            "like 'not listed in API doc' or 'marked sensitive with no API'."
+        ),
         model=model,
         client=client,
     )
     result.found_id = result.found_id or company.found_id
     result.company_name = result.company_name or company.company_name
     result.company_role = result.company_role or company.company_role
-    return _save("systems_and_data", result)
-
-
-def extract_apis(
-    files: List[str],
-    model: str = "gpt-4.1",
-    docs_root: Path = DEFAULT_DOCS_ROOT,
-    found_path: Path = DEFAULT_FOUND_PATH,
-    client: OpenAI | None = None,
-) -> Path:
-    found = _load_found(found_path)
-    company = _meta(found)
-    result: ApisExtraction = _call_llm(
-        "apis",
-        ApisExtraction,
-        files,
-        company,
-        docs_root,
-        system_hint="Identify APIs/integrations, purpose, typical endpoints or actions, auth, and any PII fields.",
-        model=model,
-        client=client,
-    )
-    result.found_id = result.found_id or company.found_id
-    result.company_name = result.company_name or company.company_name
-    result.company_role = result.company_role or company.company_role
-    return _save("apis", result)
+    return _save("system_api_coverage", result)
 
 
 def extract_all(
@@ -253,6 +248,7 @@ def extract_all(
         "people_and_roles": extract_people_and_roles(files.get("people_and_roles", []), model, docs_root, found_path, client),
         "systems_and_data": extract_systems_and_data(files.get("systems_and_data", []), model, docs_root, found_path, client),
         "apis": extract_apis(files.get("apis", []), model, docs_root, found_path, client),
+        "system_api_coverage": extract_system_api_coverage([*files.get("systems_and_data", []), str(APIS_DEFAULT_PATH)], model, docs_root, found_path, client),
     }
 
 
@@ -262,6 +258,7 @@ def _cli() -> None:
     Usage:
       python policy_extractor.py              # all categories
       python policy_extractor.py apis         # one category
+      python policy_extractor.py system_api_coverage  # systems vs API coverage
     """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("category", nargs="?", default="all")
@@ -275,6 +272,7 @@ def _cli() -> None:
         "people_and_roles": extract_people_and_roles,
         "systems_and_data": extract_systems_and_data,
         "apis": extract_apis,
+        "system_api_coverage": extract_system_api_coverage,
     }
 
     model = os.environ.get("OPENAI_MODEL", "gpt-4.1")
@@ -291,6 +289,11 @@ def _cli() -> None:
     if category == "apis":
         custom_path = args.path or str(APIS_DEFAULT_PATH)
         files = [custom_path]
+    elif category == "system_api_coverage":
+        found = _load_found(DEFAULT_FOUND_PATH)
+        system_files = (found.get("files") or {}).get("systems_and_data", [])
+        api_path = args.path or str(APIS_DEFAULT_PATH)
+        files = [*system_files, api_path]
     else:
         found = _load_found(DEFAULT_FOUND_PATH)
         files = (found.get("files") or {}).get(category, [])
