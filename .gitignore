@@ -12,4 +12,7 @@ context_*
 
 *.json
 *.md
+*.zip
 **/found_data/**
+**/test/**
+**/tests/**
