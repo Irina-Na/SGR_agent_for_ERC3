@@ -53,7 +53,7 @@ class Tee:
             stream.flush()
 
 
-def main() -> None:
+def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> None:
     task_filter = os.sys.argv[1:]
     scores = []
 
@@ -90,6 +90,8 @@ def main() -> None:
                         trial.harness_url,
                         trial.instruction,
                         provider=PROVIDER,
+                        trace_dir=trace_dir,
+                        trace_prefix=f"{run_stem}_{trial.task_id}",
                     )
                 except Exception as exc:
                     print(exc)
@@ -125,10 +127,13 @@ if __name__ == "__main__":
     runs_dir = Path(__file__).resolve().parent / "runs"
     runs_dir.mkdir(exist_ok=True)
     log_path = runs_dir / f"ecom_{datetime.now():%Y%m%d_%H%M%S}.log"
+    trace_dir = runs_dir / "traces"
+    trace_dir.mkdir(exist_ok=True)
 
     with log_path.open("w", encoding="utf-8") as log_file:
         with redirect_stdout(Tee(sys.stdout, log_file)), redirect_stderr(
             Tee(sys.stderr, log_file)
         ):
             print(f"Logging to {log_path}")
-            main()
+            print(f"LLM traces to {trace_dir}\\{log_path.stem}_<task>_step_<n>.json")
+            main(run_stem=log_path.stem, trace_dir=trace_dir)

@@ -3,7 +3,7 @@ import os
 import shlex
 import time
 from pathlib import Path
-from typing import Annotated, List, Literal, Union
+from typing import Annotated, Any, List, Literal, Union
 
 from annotated_types import Ge, Le, MaxLen, MinLen
 from bitgn.vm.ecom.ecom_connect import EcomRuntimeClientSync
@@ -368,11 +368,41 @@ def get_llm_client(provider: Literal["nebius", "openai"]) -> OpenAI:
     raise ValueError(f"Unknown provider: {provider}")
 
 
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json", warnings=False)
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump(mode="json", warnings=False)
+        except TypeError:
+            return value.model_dump(mode="json")
+    return value
+
+
+def _write_llm_trace(
+    trace_dir: Path | None,
+    trace_prefix: str,
+    step_num: int,
+    payload: dict[str, Any],
+) -> Path | None:
+    if trace_dir is None:
+        return None
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    path = trace_dir / f"{trace_prefix}_step_{step_num:02d}.json"
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return path
+
+
 def run_agent(
     model: str,
     harness_url: str,
     task_text: str,
     provider: Literal["nebius", "openai"] = "nebius",
+    trace_dir: Path | None = None,
+    trace_prefix: str = "ecom",
 ) -> None:
     client = get_llm_client(provider)
     vm = EcomRuntimeClientSync(harness_url)
@@ -396,14 +426,51 @@ def run_agent(
     for i in range(30):
         step = f"step_{i + 1}"
         started = time.time()
-        resp = client.beta.chat.completions.parse(
-            model=model,
-            response_format=NextStep,
-            messages=log,
-            max_completion_tokens=16384,
-        )
+        request_payload = {
+            "provider": provider,
+            "model": model,
+            "response_format": "NextStep",
+            "messages": log,
+            "max_completion_tokens": 16384,
+        }
+        try:
+            resp = client.beta.chat.completions.parse(
+                model=model,
+                response_format=NextStep,
+                messages=log,
+                max_completion_tokens=16384,
+            )
+        except Exception as exc:
+            _write_llm_trace(
+                trace_dir,
+                trace_prefix,
+                i + 1,
+                {
+                    "step": step,
+                    "request": request_payload,
+                    "error": repr(exc),
+                },
+            )
+            raise
         elapsed_ms = int((time.time() - started) * 1000)
-        job = resp.choices[0].message.parsed
+        raw_message = resp.choices[0].message
+        job = raw_message.parsed
+        trace_path = _write_llm_trace(
+            trace_dir,
+            trace_prefix,
+            i + 1,
+            {
+                "step": step,
+                "elapsed_ms": elapsed_ms,
+                "request": request_payload,
+                "response": _jsonable(resp),
+                "message": _jsonable(raw_message),
+                "parsed": _jsonable(job) if job is not None else None,
+            },
+        )
+        if job is None:
+            hint = f"; see {trace_path}" if trace_path else ""
+            raise ValueError(f"LLM response did not parse as NextStep{hint}")
 
         print(
             f"Next {step}... {job.plan_remaining_steps_brief[0]} ({elapsed_ms} ms)\n"
