@@ -1,4 +1,6 @@
 import os
+import re
+import subprocess
 import sys
 import textwrap
 from contextlib import redirect_stderr, redirect_stdout
@@ -53,7 +55,38 @@ class Tee:
             stream.flush()
 
 
-def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> None:
+def _safe_filename_part(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"[^\w.-]+", "_", value)
+    value = value.strip("._")
+    return value or "unknown"
+
+
+def _last_commit_id() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    for index in range(1, 1000):
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+
+    raise FileExistsError(f"Could not find a free report filename for {path}")
+
+
+def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
     task_filter = os.sys.argv[1:]
     scores = []
 
@@ -121,14 +154,21 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> None:
 
         total = sum(score for _, score in scores) / len(scores) * 100.0
         print(f"FINAL: {total:0.2f}%")
+        return total
+
+    return None
 
 
 if __name__ == "__main__":
     runs_dir = Path(__file__).resolve().parent / "runs"
     runs_dir.mkdir(exist_ok=True)
-    log_path = runs_dir / f"ecom_{datetime.now():%Y%m%d_%H%M%S}.log"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_part = _safe_filename_part(MODEL_ID)
+    commit_part = _safe_filename_part(_last_commit_id())
+    log_path = runs_dir / f"{timestamp}_{model_part}_git{commit_part}.log"
     trace_dir = runs_dir / "traces"
     trace_dir.mkdir(exist_ok=True)
+    final_score = None
 
     with log_path.open("w", encoding="utf-8") as log_file:
         with redirect_stdout(Tee(sys.stdout, log_file)), redirect_stderr(
@@ -136,4 +176,12 @@ if __name__ == "__main__":
         ):
             print(f"Logging to {log_path}")
             print(f"LLM traces to {trace_dir}\\{log_path.stem}_<task>_step_<n>.json")
-            main(run_stem=log_path.stem, trace_dir=trace_dir)
+            final_score = main(run_stem=log_path.stem, trace_dir=trace_dir)
+
+    score_part = "score_na" if final_score is None else f"score_{final_score:0.2f}"
+    final_log_path = _unique_path(
+        runs_dir / f"{timestamp}_{model_part}_{score_part}_git{commit_part}.log"
+    )
+    if final_log_path != log_path:
+        log_path.replace(final_log_path)
+        print(f"Final report: {final_log_path}")

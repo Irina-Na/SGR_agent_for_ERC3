@@ -12,6 +12,7 @@ context_*
 
 *.json
 *.md
+!ecom-vanilla/AGENT_FAILURE_NATURE_RESEARCH.md
 *.zip
 **/found_data/**
 **/test/**

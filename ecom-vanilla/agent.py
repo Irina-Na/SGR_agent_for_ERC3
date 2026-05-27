@@ -24,7 +24,7 @@ from bitgn.vm.ecom.ecom_pb2 import (
 from connectrpc.errors import ConnectError
 from google.protobuf.json_format import MessageToDict
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 
 def _load_env_file(path: Path) -> None:
@@ -369,6 +369,43 @@ def get_llm_client(provider: Literal["nebius", "openai"]) -> OpenAI:
     raise ValueError(f"Unknown provider: {provider}")
 
 
+def build_json_system_prompt() -> str:
+    schema = json.dumps(NextStep.model_json_schema(), ensure_ascii=False)
+    return f"""{system_prompt.rstrip()}
+
+# Output contract
+
+Return only one valid JSON object. No markdown, no prose, no comments, no code fences.
+Do not use native tool calls. Do not emit special tool-call sections such as
+<|tool_calls_section_begin|>. The `function` field is plain JSON data, not an
+actual tool call.
+
+The JSON must validate against this schema:
+{schema}
+"""
+
+
+def extract_json_candidate(content: str) -> str:
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    if text.startswith("{") and text.endswith("}"):
+        return text
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        return text[start : end + 1].strip()
+
+    return text
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json", warnings=False)
@@ -407,6 +444,118 @@ def _format_history_step(step: str, job: NextStep, result_text: str) -> str:
     )
 
 
+def query_next_step_json(
+    client: OpenAI,
+    model: str,
+    messages: list[dict[str, str]],
+    trace_dir: Path | None,
+    trace_prefix: str,
+    step_num: int,
+    max_attempts: int = 3,
+) -> NextStep:
+    attempts = []
+    attempt_messages = list(messages)
+    last_error = None
+    trace_path = None
+
+    for attempt_num in range(1, max_attempts + 1):
+        started = time.time()
+        request_payload = {
+            "model": model,
+            "messages": attempt_messages,
+            "max_completion_tokens": 16384,
+            "attempt": attempt_num,
+        }
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=attempt_messages,
+                max_completion_tokens=16384,
+            )
+            elapsed_ms = int((time.time() - started) * 1000)
+            raw_message = resp.choices[0].message
+            content = raw_message.content or ""
+            candidate = extract_json_candidate(content)
+            try:
+                parsed = NextStep.model_validate_json(candidate)
+                attempts.append(
+                    {
+                        "attempt": attempt_num,
+                        "elapsed_ms": elapsed_ms,
+                        "request": request_payload,
+                        "response": _jsonable(resp),
+                        "message": _jsonable(raw_message),
+                        "content": content,
+                        "json_candidate": candidate,
+                        "parsed": _jsonable(parsed),
+                    }
+                )
+                _write_llm_trace(
+                    trace_dir,
+                    trace_prefix,
+                    step_num,
+                    {"step": f"step_{step_num}", "attempts": attempts},
+                )
+                return parsed
+            except ValidationError as exc:
+                last_error = exc
+                attempts.append(
+                    {
+                        "attempt": attempt_num,
+                        "elapsed_ms": elapsed_ms,
+                        "request": request_payload,
+                        "response": _jsonable(resp),
+                        "message": _jsonable(raw_message),
+                        "content": content,
+                        "json_candidate": candidate,
+                        "validation_error": str(exc),
+                    }
+                )
+                attempt_messages = list(messages) + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous response was invalid JSON for the required schema.\n"
+                            f"Validation error:\n{exc}\n\n"
+                            "Retry now. Return only one valid JSON object. No markdown, "
+                            "no prose, no native tool calls, no special tool-call sections."
+                        ),
+                    }
+                ]
+        except Exception as exc:
+            last_error = exc
+            attempts.append(
+                {
+                    "attempt": attempt_num,
+                    "request": request_payload,
+                    "error": repr(exc),
+                }
+            )
+            attempt_messages = list(messages) + [
+                {
+                    "role": "user",
+                    "content": (
+                        "The previous completion failed before producing valid JSON.\n"
+                        f"Error:\n{exc}\n\n"
+                        "Retry now. Return only one valid JSON object."
+                    ),
+                }
+            ]
+
+        trace_path = _write_llm_trace(
+            trace_dir,
+            trace_prefix,
+            step_num,
+            {"step": f"step_{step_num}", "attempts": attempts},
+        )
+
+    hint = f"; see {trace_path}" if trace_path else ""
+    raise ValueError(
+        f"LLM response did not validate as NextStep after {max_attempts} attempts"
+        f"{hint}: {last_error}"
+    )
+
+
 def run_agent(
     model: str,
     harness_url: str,
@@ -417,7 +566,7 @@ def run_agent(
 ) -> None:
     client = get_llm_client(provider)
     vm = EcomRuntimeClientSync(harness_url)
-    log = [{"role": "system", "content": system_prompt}]
+    log = [{"role": "system", "content": build_json_system_prompt()}]
 
     must = [
         Req_Tree(level=2, tool="tree", root="/"),
@@ -437,51 +586,15 @@ def run_agent(
     for i in range(30):
         step = f"step_{i + 1}"
         started = time.time()
-        request_payload = {
-            "provider": provider,
-            "model": model,
-            "response_format": "NextStep",
-            "messages": log,
-            "max_completion_tokens": 16384,
-        }
-        try:
-            resp = client.beta.chat.completions.parse(
-                model=model,
-                response_format=NextStep,
-                messages=log,
-                max_completion_tokens=16384,
-            )
-        except Exception as exc:
-            _write_llm_trace(
-                trace_dir,
-                trace_prefix,
-                i + 1,
-                {
-                    "step": step,
-                    "request": request_payload,
-                    "error": repr(exc),
-                },
-            )
-            raise
-        elapsed_ms = int((time.time() - started) * 1000)
-        raw_message = resp.choices[0].message
-        job = raw_message.parsed
-        trace_path = _write_llm_trace(
+        job = query_next_step_json(
+            client,
+            model,
+            log,
             trace_dir,
             trace_prefix,
             i + 1,
-            {
-                "step": step,
-                "elapsed_ms": elapsed_ms,
-                "request": request_payload,
-                "response": _jsonable(resp),
-                "message": _jsonable(raw_message),
-                "parsed": _jsonable(job) if job is not None else None,
-            },
         )
-        if job is None:
-            hint = f"; see {trace_path}" if trace_path else ""
-            raise ValueError(f"LLM response did not parse as NextStep{hint}")
+        elapsed_ms = int((time.time() - started) * 1000)
 
         print(
             f"Next {step}... {job.plan_remaining_steps_brief[0]} ({elapsed_ms} ms)\n"
