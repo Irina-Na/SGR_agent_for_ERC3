@@ -13,6 +13,7 @@ context_*
 *.json
 *.md
 !ecom-vanilla/AGENT_FAILURE_NATURE_RESEARCH.md
+!ecom-vanilla/TOOL_CALLING_FAILURE_COMPARISON.md
 *.zip
 **/found_data/**
 **/test/**

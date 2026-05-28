@@ -1,4 +1,4 @@
-# Research Notes: Why Agents Miss Instructions They Have Read
+# Investigation: Nature of Agent Failure Patterns
 
 ## Research Question
 
@@ -9,6 +9,11 @@ answer.
 The goal is not to add a new reminder for every discovered misunderstanding.
 That approach does not scale. The goal is to understand what kind of failure this
 is and what general agent design patterns reduce it.
+
+This document treats individual benchmark errors as evidence about agent control
+failure patterns. The target is not a longer rule collection. The target is a
+small set of durable design patterns that make important task contracts harder
+to lose.
 
 ## Example
 
@@ -105,6 +110,102 @@ At finalization time, it had a correct claim but incomplete provenance. It then
 filled `grounding_refs` with nearby conceptual sources instead of the exact
 object.
 
+## Additional Evidence: Message Text Is Not Structured Refs
+
+There is a stricter variant of the same failure. In this variant, the exact path
+appears in the human-readable message, but the structured `refs` field is still
+wrong.
+
+The platform receives two separate fields:
+
+```text
+message
+refs
+```
+
+The agent sends them separately in `agent.py`:
+
+```python
+AnswerRequest(
+    message=cmd.message,
+    outcome=OUTCOME_BY_NAME[cmd.outcome],
+    refs=cmd.grounding_refs,
+)
+```
+
+For one failing run, the actual submitted object had the path in the message:
+
+```python
+message = """<YES> The Heco ... is available.
+
+**Product:** `FST-1KPF96UD`
+- Path: `/proc/catalog/FST-1KPF96UD.json`
+...
+"""
+```
+
+But the structured references were:
+
+```python
+refs = ["products.path:/proc/catalog/FST-1KPF96UD.json"]
+```
+
+The grader checked the structured `refs` field, not only the text in
+`message`. It required exactly:
+
+```text
+/proc/catalog/FST-1KPF96UD.json
+```
+
+The submitted string was different:
+
+```text
+products.path:/proc/catalog/FST-1KPF96UD.json
+```
+
+So the grader correctly reported:
+
+```text
+answer missing required reference '/proc/catalog/FST-1KPF96UD.json'
+```
+
+The terminal log can make this easy to misread:
+
+```text
+AGENT SUMMARY = cmd.message
+lines printed after it with "- ..." = cmd.grounding_refs
+```
+
+The real submitted answer was therefore closer to:
+
+```json
+{
+  "message": "... Path: /proc/catalog/FST-1KPF96UD.json ...",
+  "refs": ["products.path:/proc/catalog/FST-1KPF96UD.json"],
+  "outcome": "OUTCOME_OK"
+}
+```
+
+This matters because it narrows the diagnosis. The problem is not merely that
+the agent failed to mention the path. The path was present in prose. The problem
+is that the platform contract required a normalized exact string in a separate
+structured channel, and that contract was not enforced before submission.
+
+The scalable fix is not another reminder like:
+
+```text
+Do not prefix refs with products.path.
+```
+
+The general fix is a reference normalization and validation layer:
+
+```text
+refs must be exact canonical object paths
+refs must not contain schema prefixes such as products.path:
+refs must not be broad table names, field names, or directories
+refs must be checked independently of message text
+```
+
 ## Hypothesis
 
 Many agent failures of this kind are not failures of instruction visibility.
@@ -135,12 +236,18 @@ This class of error has several recurring properties:
 
    It treats "where I searched" as equivalent to "the object I am referencing".
 
-4. The schema is too permissive.
+4. The model confuses message grounding with structured grounding.
+
+   It assumes that a path written in `message` satisfies the reference contract,
+   even though the grader checks `refs` separately.
+
+5. The schema is too permissive.
 
    `grounding_refs: List[str]` accepts broad directories, table names, and exact
-   object paths equally.
+   object paths equally. It also accepts malformed values such as
+   `products.path:/proc/catalog/...`.
 
-5. There is no final audit.
+6. There is no final audit.
 
    Nothing checks whether the final output satisfies the original contract.
 
@@ -296,6 +403,7 @@ grounding_refs=['products.sku', 'product_properties.sku', 'inventory.store_id']
 The agent often knew the relevant fact, but the final references were either:
 
 - broad schema/table identifiers,
+- field-prefixed paths such as `products.path:/proc/catalog/...`,
 - plausible but nonexistent paths,
 - object paths without the policy document that authorized the decision.
 
@@ -304,6 +412,13 @@ This is not one "remember to cite X" problem. It is one provenance invariant:
 ```text
 Every final claim or action must carry concrete source identities through the
 whole reasoning chain.
+```
+
+For this platform, provenance has a channel requirement:
+
+```text
+The structured `refs` field must contain the canonical source identities. A path
+inside `message` is useful to humans but does not satisfy the grader contract.
 ```
 
 For policy decisions, the concrete source identity is not only the business
@@ -495,6 +610,36 @@ messages confuse the provider.
 The later implementation direction moved toward this: it added explicit JSON
 extraction/retry logic and records each step as state, plan, action, and result.
 
+## Laconic Comparison: Kimi 20260527_191354
+
+Compared log:
+`runs/20260527_191354_moonshotai_Kimi-K2.6_gitbcc318e.log`
+
+```text
+                     Qwen 180319   Kimi 191354
+task starts          50            48
+scored tasks         50            47
+perfect              3             17
+partial              3             1
+zero                 44            29
+length-limit parse   8             0
+missing refs         12            17
+invalid refs         2             4
+outcome mismatch     19            5
+strict format miss   4             1
+```
+
+Kimi reduced protocol/parse and outcome failures, but did not remove the core
+failure. The dominant remaining pattern became structured reference drift:
+missing, invalid, or non-canonical `refs`.
+
+The comparison supports the same diagnosis:
+
+```text
+Better model behavior helps, but durable contracts and finalization validation
+are still required.
+```
+
 ## The Broader Failure Class
 
 The best name for the broader class is:
@@ -549,12 +694,30 @@ claim
 object_type
 object_id
 object_path
+canonical_ref
 supporting_fields
 policy_path
 tool_result_step
 ```
 
-The final answer can only cite paths already present in the ledger.
+The final answer can only cite paths already present in the ledger. The
+submitted `refs` field should be derived from `canonical_ref`, not from free-form
+tool-output labels.
+
+### Reference Normalization
+
+Normalize and validate references before calling `AnswerRequest`:
+
+```text
+products.path:/proc/catalog/FST-1KPF96UD.json -> /proc/catalog/FST-1KPF96UD.json
+/proc/catalog/FST-1KPF96UD.json -> /proc/catalog/FST-1KPF96UD.json
+products.path -> reject
+/proc/catalog/products -> reject unless the task truly asks for a directory
+```
+
+This is not a product-specific fix. It is a protocol-boundary fix: the platform
+accepts `message` and `refs` separately, so the finalization layer must validate
+the structured channel directly.
 
 ### Tool-Result Shaping
 
@@ -597,6 +760,8 @@ Does message match exact requested format?
 Are required tokens present?
 Do grounding refs exist?
 Are refs concrete object paths or required policy docs?
+Are refs canonical strings with no schema prefixes?
+Would the answer still pass if the grader ignored paths inside message text?
 Do refs correspond to objects named in the answer?
 If policy was applied, is the policy doc cited?
 If action was performed, was it authorized and expected?
