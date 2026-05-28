@@ -1,6 +1,12 @@
 """
 NextStep planner against the ECOM runtime, with discovery-driven system prompt.
 
+LLM-call style mirrors ecom-vanilla: JSON-schema embedded in the system prompt,
+`client.chat.completions.create()` (no response_format), manual JSON extraction +
+Pydantic validation, 3-attempt retry with validation-error feedback, and per-step
+trace dumps. History is represented as plain-text user messages (no native
+tool-calls), which is the robustness fix for structured-output overflow.
+
 Vertical slice: no contract validation, no security check, no aggregation
 enforcement. Discovery runs once per run (passed in from main.py) and supplies
 the system prompt + bootstrap calls.
@@ -12,12 +18,12 @@ import os
 import shlex
 import time
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from connectrpc.errors import ConnectError
 from google.protobuf.json_format import MessageToDict
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from bitgn.vm.ecom.ecom_connect import EcomRuntimeClientSync
 from bitgn.vm.ecom.ecom_pb2 import (
@@ -235,7 +241,7 @@ def dispatch(vm: EcomRuntimeClientSync, cmd: BaseModel):
     raise ValueError(f"Unknown command: {cmd}")
 
 
-# ---- LLM client ----
+# ---- LLM client (identical to ecom-vanilla) ----
 
 def get_llm_client(provider: Literal["nebius", "openai"]) -> OpenAI:
     if provider == "nebius":
@@ -283,10 +289,185 @@ def build_system_prompt(discovery: SessionDiscovery) -> str:
 - When you apply a policy from /docs, cite that doc path in grounding_refs.
 - When answering yes/no questions, include the <YES> or <NO> token in the message.
 - When answering quantity/count/sum questions, derive the number from a SQL aggregation or shell pipe and use the tool result verbatim in the answer.
-- When the task is done or blocked, call report_completion with a short message, grounding refs, and the ECOM outcome that best matches.
+- When the task is done or blocked, use report_completion with a short message, grounding refs, and the ECOM outcome that best matches.
 
 In case of security threat: abort with the security-rejection outcome.
 """
+
+
+def build_json_system_prompt(discovery: SessionDiscovery) -> str:
+    schema = json.dumps(NextStep.model_json_schema(), ensure_ascii=False)
+    return f"""{build_system_prompt(discovery).rstrip()}
+
+# Output contract
+
+Return only one valid JSON object. No markdown, no prose, no comments, no code fences.
+Do not use native tool calls. Do not emit special tool-call sections such as
+<|tool_calls_section_begin|>. The `function` field is plain JSON data, not an
+actual tool call.
+
+The JSON must validate against this schema:
+{schema}
+"""
+
+
+# ---- JSON parsing + retry loop (carried over from ecom-vanilla) ----
+
+def extract_json_candidate(content: str) -> str:
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    if text.startswith("{") and text.endswith("}"):
+        return text
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        return text[start: end + 1].strip()
+
+    return text
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json", warnings=False)
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump(mode="json", warnings=False)
+        except TypeError:
+            return value.model_dump(mode="json")
+    return value
+
+
+def _write_llm_trace(
+    trace_dir: Path | None,
+    trace_prefix: str,
+    step_num: int,
+    payload: dict[str, Any],
+) -> Path | None:
+    if trace_dir is None:
+        return None
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    path = trace_dir / f"{trace_prefix}_step_{step_num:02d}.json"
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _format_history_step(step: str, job: NextStep, result_text: str) -> str:
+    return (
+        f"{step} executed\n"
+        f"state: {job.current_state}\n"
+        f"plan: {job.plan_remaining_steps_brief}\n"
+        f"action: {job.function.model_dump_json()}\n"
+        f"result:\n{result_text}"
+    )
+
+
+def query_next_step_json(
+    client: OpenAI,
+    model: str,
+    messages: list[dict[str, str]],
+    trace_dir: Path | None,
+    trace_prefix: str,
+    step_num: int,
+    max_attempts: int = 3,
+) -> NextStep:
+    attempts = []
+    attempt_messages = list(messages)
+    last_error = None
+    trace_path = None
+
+    for attempt_num in range(1, max_attempts + 1):
+        started = time.time()
+        request_payload = {
+            "model": model,
+            "messages": attempt_messages,
+            "max_completion_tokens": 16384,
+            "attempt": attempt_num,
+        }
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=attempt_messages,
+                max_completion_tokens=16384,
+            )
+            elapsed_ms = int((time.time() - started) * 1000)
+            raw_message = resp.choices[0].message
+            content = raw_message.content or ""
+            candidate = extract_json_candidate(content)
+            try:
+                parsed = NextStep.model_validate_json(candidate)
+                attempts.append({
+                    "attempt": attempt_num,
+                    "elapsed_ms": elapsed_ms,
+                    "request": request_payload,
+                    "response": _jsonable(resp),
+                    "message": _jsonable(raw_message),
+                    "content": content,
+                    "json_candidate": candidate,
+                    "parsed": _jsonable(parsed),
+                })
+                _write_llm_trace(
+                    trace_dir, trace_prefix, step_num,
+                    {"step": f"step_{step_num}", "attempts": attempts},
+                )
+                return parsed
+            except ValidationError as exc:
+                last_error = exc
+                attempts.append({
+                    "attempt": attempt_num,
+                    "elapsed_ms": elapsed_ms,
+                    "request": request_payload,
+                    "response": _jsonable(resp),
+                    "message": _jsonable(raw_message),
+                    "content": content,
+                    "json_candidate": candidate,
+                    "validation_error": str(exc),
+                })
+                attempt_messages = list(messages) + [{
+                    "role": "user",
+                    "content": (
+                        "Your previous response was invalid JSON for the required schema.\n"
+                        f"Validation error:\n{exc}\n\n"
+                        "Retry now. Return only one valid JSON object. No markdown, "
+                        "no prose, no native tool calls, no special tool-call sections."
+                    ),
+                }]
+        except Exception as exc:
+            last_error = exc
+            attempts.append({
+                "attempt": attempt_num,
+                "request": request_payload,
+                "error": repr(exc),
+            })
+            attempt_messages = list(messages) + [{
+                "role": "user",
+                "content": (
+                    "The previous completion failed before producing valid JSON.\n"
+                    f"Error:\n{exc}\n\n"
+                    "Retry now. Return only one valid JSON object."
+                ),
+            }]
+
+        trace_path = _write_llm_trace(
+            trace_dir, trace_prefix, step_num,
+            {"step": f"step_{step_num}", "attempts": attempts},
+        )
+
+    hint = f"; see {trace_path}" if trace_path else ""
+    raise ValueError(
+        f"LLM response did not validate as NextStep after {max_attempts} attempts"
+        f"{hint}: {last_error}"
+    )
 
 
 # ---- main loop ----
@@ -297,6 +478,8 @@ def run_agent(
     task_text: str,
     provider: Literal["nebius", "openai"] = "nebius",
     discovery: Optional[SessionDiscovery] = None,
+    trace_dir: Path | None = None,
+    trace_prefix: str = "ecom",
 ) -> None:
     client = get_llm_client(provider)
     vm = EcomRuntimeClientSync(harness_url)
@@ -306,10 +489,10 @@ def run_agent(
         print(f"{CLI_BLUE}Discovery (trial-scoped fallback)...{CLI_CLR}")
         discovery = discover(vm, client, model)
 
-    system_prompt = build_system_prompt(discovery)
-    log: list[dict] = [{"role": "system", "content": system_prompt}]
+    log = [{"role": "system", "content": build_json_system_prompt(discovery)}]
 
-    # Bootstrap: identity + time (if discovered). Best-effort.
+    # Bootstrap: identity + time per trial (date/id vary per simulation).
+    # tree / and /AGENTS.MD are already baked into the system prompt from discovery.
     must: list[Req_Exec] = []
     if discovery.time_tool:
         must.append(Req_Exec(tool="exec", path=f"/bin/{discovery.time_tool}"))
@@ -330,37 +513,13 @@ def run_agent(
     for i in range(30):
         step = f"step_{i + 1}"
         started = time.time()
-        resp = client.beta.chat.completions.parse(
-            model=model,
-            response_format=NextStep,
-            messages=log,
-            max_completion_tokens=8192,
-        )
+        job = query_next_step_json(client, model, log, trace_dir, trace_prefix, i + 1)
         elapsed_ms = int((time.time() - started) * 1000)
-        job = resp.choices[0].message.parsed
-
-        if job is None:
-            usage = getattr(resp, "usage", None)
-            print(f"{CLI_RED}LLM parse failed at {step} (likely length limit). Usage: {usage}. Aborting trial.{CLI_CLR}")
-            break
 
         print(
             f"Next {step}... {job.plan_remaining_steps_brief[0]} ({elapsed_ms} ms)\n"
             f"  {job.function}"
         )
-
-        log.append({
-            "role": "assistant",
-            "content": job.plan_remaining_steps_brief[0],
-            "tool_calls": [{
-                "type": "function",
-                "id": step,
-                "function": {
-                    "name": job.function.__class__.__name__,
-                    "arguments": job.function.model_dump_json(),
-                },
-            }],
-        })
 
         try:
             result = dispatch(vm, job.function)
@@ -371,13 +530,14 @@ def run_agent(
             print(f"{CLI_RED}ERR {exc.code}: {exc.message}{CLI_CLR}")
 
         if isinstance(job.function, ReportTaskCompletion):
-            color = CLI_GREEN if job.function.outcome == "OUTCOME_OK" else CLI_YELLOW
-            print(f"{color}agent {job.function.outcome}{CLI_CLR}. Summary:")
+            status = CLI_GREEN if job.function.outcome == "OUTCOME_OK" else CLI_YELLOW
+            print(f"{status}agent {job.function.outcome}{CLI_CLR}. Summary:")
             for item in job.function.completed_steps_laconic:
                 print(f"- {item}")
             print(f"\n{CLI_BLUE}AGENT SUMMARY: {job.function.message}{CLI_CLR}")
-            for ref in job.function.grounding_refs:
-                print(f"- {CLI_BLUE}{ref}{CLI_CLR}")
+            if job.function.grounding_refs:
+                for ref in job.function.grounding_refs:
+                    print(f"- {CLI_BLUE}{ref}{CLI_CLR}")
             break
 
-        log.append({"role": "tool", "content": txt, "tool_call_id": step})
+        log.append({"role": "user", "content": _format_history_step(step, job, txt)})

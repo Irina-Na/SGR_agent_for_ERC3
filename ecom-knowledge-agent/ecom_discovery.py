@@ -9,6 +9,7 @@ trials within a run, so in-memory reuse is sufficient.
 """
 from __future__ import annotations
 
+import json
 from typing import Dict, List, Literal, Optional
 
 from openai import OpenAI
@@ -112,6 +113,24 @@ def _outcome_enum_names() -> List[str]:
     return [v.name for v in Outcome.DESCRIPTOR.values]
 
 
+def _extract_json_candidate(content: str) -> str:
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        return text[start: end + 1].strip()
+    return text
+
+
 _SYSTEM_PROMPT = """You are classifying an ECOM runtime environment. You are given:
 - The root /AGENTS.MD content (describes tools, conventions, key locations)
 - tree output for /bin (utility inventory)
@@ -151,25 +170,35 @@ def discover(
     entity_kinds = _collect_proc_kinds(vm)
     docs_paths = _collect_docs_paths(vm)
 
-    # 6: one structured LLM call
+    # 6: one LLM call — JSON-schema-in-prompt + manual validate (same style as the
+    # main loop; avoids constrained decoding that the Nebius/Qwen model handles poorly)
+    schema = json.dumps(_ClassificationResult.model_json_schema(), ensure_ascii=False)
+    system = (
+        f"{_SYSTEM_PROMPT.rstrip()}\n\n"
+        "Return only one valid JSON object. No markdown, no prose, no code fences.\n"
+        f"The JSON must validate against this schema:\n{schema}"
+    )
     user_msg = (
         f"# /AGENTS.MD\n{agents_md}\n\n"
         f"# tree /bin\n{bin_tree}\n\n"
         f"# tree /docs\n{docs_tree}\n\n"
         f"# tree /proc\n{proc_tree}\n"
     )
-    resp = llm_client.beta.chat.completions.parse(
+    resp = llm_client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": user_msg},
         ],
-        response_format=_ClassificationResult,
+        max_completion_tokens=16384,
     )
-    cls = resp.choices[0].message.parsed
-    if cls is None:
-        # safety net — keep going with empty taxonomies; the agent will still function,
+    content = resp.choices[0].message.content or ""
+    try:
+        cls = _ClassificationResult.model_validate_json(_extract_json_candidate(content))
+    except Exception as exc:  # noqa: BLE001
+        # safety net — keep going with empty taxonomies; the agent still functions,
         # just without classification metadata
+        print(f"discovery classification failed ({exc}); continuing with empty taxonomies")
         cls = _ClassificationResult(
             tool_classifications=[],
             identity_tool=None,
