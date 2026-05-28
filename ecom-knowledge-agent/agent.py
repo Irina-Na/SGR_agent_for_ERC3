@@ -55,6 +55,10 @@ from api_tools import (
     ReportTaskCompletion,
 )
 from ecom_discovery import SessionDiscovery, discover
+from contract_validator import harvest_paths, validate_report
+
+
+MAX_VALIDATION_RETRIES = 3
 
 
 def _load_env_file(path: Path) -> None:
@@ -510,34 +514,62 @@ def run_agent(
 
     log.append({"role": "user", "content": task_text})
 
+    # Evidence ledger: paths observed in tool results this trial; docs actually read.
+    seen_paths: set[str] = set()
+    docs_read: set[str] = set()
+    validation_retries = 0
+
     for i in range(30):
         step = f"step_{i + 1}"
         started = time.time()
         job = query_next_step_json(client, model, log, trace_dir, trace_prefix, i + 1)
         elapsed_ms = int((time.time() - started) * 1000)
+        fn = job.function
 
         print(
             f"Next {step}... {job.plan_remaining_steps_brief[0]} ({elapsed_ms} ms)\n"
-            f"  {job.function}"
+            f"  {fn}"
         )
 
+        # ---- Finalization gate: validate report_completion before submitting ----
+        if isinstance(fn, ReportTaskCompletion):
+            violations = validate_report(fn, seen_paths, discovery, docs_read)
+            if violations and validation_retries < MAX_VALIDATION_RETRIES:
+                validation_retries += 1
+                msg = "VALIDATION_FAILED (do not resubmit unchanged):\n- " + "\n- ".join(violations)
+                print(f"{CLI_YELLOW}{msg}{CLI_CLR}")
+                log.append({"role": "user", "content": msg})
+                continue
+            # accept (passed, or retry budget exhausted) → submit the answer
+            try:
+                dispatch(vm, fn)
+            except ConnectError as exc:
+                print(f"{CLI_RED}ERR {exc.code}: {exc.message}{CLI_CLR}")
+            status = CLI_GREEN if fn.outcome == "OUTCOME_OK" else CLI_YELLOW
+            print(f"{status}agent {fn.outcome}{CLI_CLR}. Summary:")
+            for item in fn.completed_steps_laconic:
+                print(f"- {item}")
+            print(f"\n{CLI_BLUE}AGENT SUMMARY: {fn.message}{CLI_CLR}")
+            for ref in fn.grounding_refs:
+                print(f"- {CLI_BLUE}{ref}{CLI_CLR}")
+            break
+
+        # ---- non-terminal tool: dispatch, record evidence, append history ----
         try:
-            result = dispatch(vm, job.function)
-            txt = _format_result(job.function, result)
+            result = dispatch(vm, fn)
+            txt = _format_result(fn, result)
             print(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
         except ConnectError as exc:
             txt = str(exc.message)
             print(f"{CLI_RED}ERR {exc.code}: {exc.message}{CLI_CLR}")
 
-        if isinstance(job.function, ReportTaskCompletion):
-            status = CLI_GREEN if job.function.outcome == "OUTCOME_OK" else CLI_YELLOW
-            print(f"{status}agent {job.function.outcome}{CLI_CLR}. Summary:")
-            for item in job.function.completed_steps_laconic:
-                print(f"- {item}")
-            print(f"\n{CLI_BLUE}AGENT SUMMARY: {job.function.message}{CLI_CLR}")
-            if job.function.grounding_refs:
-                for ref in job.function.grounding_refs:
-                    print(f"- {CLI_BLUE}{ref}{CLI_CLR}")
-            break
+        # Harvest citeable paths from this result. Only a Req_Read target counts as
+        # "read" for the docs-citation rule; paths merely listed/matched don't.
+        new_paths = harvest_paths(txt)
+        if isinstance(fn, Req_Read):
+            new_paths.add(fn.path)
+            if fn.path.startswith("/docs/"):
+                docs_read.add(fn.path)
+        seen_paths.update(new_paths)
 
         log.append({"role": "user", "content": _format_history_step(step, job, txt)})

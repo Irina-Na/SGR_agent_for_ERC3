@@ -1,7 +1,7 @@
 [project]
 name = "bitgn-ecom-knowledge"
-version = "0.1.0"
-description = "Knowledge-augmented ECOM agent: NextStep loop + session-scoped discovery"
+version = "0.2.0"
+description = "Knowledge-augmented ECOM agent: NextStep loop + discovery + evidence ledger / finalization gate"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [

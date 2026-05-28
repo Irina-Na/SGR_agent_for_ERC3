@@ -110,7 +110,7 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
         )
 
         run = client.start_run(StartRunRequest(
-            name=f"@Irinai_Na Knowledge Agent v0.1 ({MODEL_ID})",
+            name=f"@Irinai_Na Knowledge Agent v0.2 ({MODEL_ID})",
             benchmark_id=BENCH_ID,
             api_key=BITGN_API_KEY,
         ))
