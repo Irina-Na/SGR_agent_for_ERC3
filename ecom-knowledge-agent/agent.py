@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import time
 from pathlib import Path
@@ -55,7 +56,7 @@ from api_tools import (
     ReportTaskCompletion,
 )
 from ecom_discovery import SessionDiscovery, discover
-from contract_validator import harvest_paths, validate_report
+from contract_validator import validate_report
 
 
 MAX_VALIDATION_RETRIES = 3
@@ -207,6 +208,59 @@ def _format_result(cmd: BaseModel, result) -> str:
     return json.dumps(MessageToDict(result), indent=2)
 
 
+# ---- evidence harvesting from STRUCTURED results (NodeKind-aware, extension-agnostic) ----
+
+# /-rooted token for exec/SQL stdout. No extension requirement: SQL `path` cells are
+# citeable regardless of extension. Over-capture here only relaxes the gate (avoids
+# false rejection); bare-dir protection stays on the structured FILE-kind tools below.
+_EXEC_PATH_RE = re.compile(r"/[^\s,;\"'\]\)\}#]+")
+
+
+def _join(base: str, name: str) -> str:
+    return (base.rstrip("/") + "/" + name) if base not in ("", "/") else "/" + name
+
+
+def _walk_tree_files(node, cur_path: str, out: set[str]) -> None:
+    for child in node.children:
+        child_path = _join(cur_path, child.name)
+        if child.kind == NodeKind.NODE_KIND_FILE:
+            out.add(child_path)
+        elif child.kind == NodeKind.NODE_KIND_DIR:
+            _walk_tree_files(child, child_path, out)
+
+
+def harvest_from_result(cmd: BaseModel, result) -> set[str]:
+    """Extract citeable FILE paths from a structured RPC result.
+
+    Uses the runtime's own NodeKind (FILE vs DIR) where available, so it survives
+    a change in object-path extensions in prod. Directories and tool paths are
+    never added (they aren't FILE nodes and don't appear as SQL path cells)."""
+    out: set[str] = set()
+    if result is None:
+        return out
+    if isinstance(cmd, Req_Read):
+        out.add(cmd.path)
+    elif isinstance(cmd, Req_Tree):
+        _walk_tree_files(result.root, cmd.root or "/", out)
+    elif isinstance(cmd, Req_List):
+        for e in result.entries:
+            if e.kind == NodeKind.NODE_KIND_FILE:
+                out.add(_join(cmd.path or "/", e.name))
+    elif isinstance(cmd, Req_Search):
+        for m in result.matches:
+            out.add(m.path)
+    elif isinstance(cmd, Req_Exec):
+        out.update(_EXEC_PATH_RE.findall(getattr(result, "stdout", "") or ""))
+    elif isinstance(cmd, Req_Find):
+        # FindResponse shape not asserted here; harvest /-rooted tokens from the
+        # serialized result (permissive — only relaxes the gate).
+        try:
+            out.update(_EXEC_PATH_RE.findall(json.dumps(MessageToDict(result))))
+        except Exception:
+            pass
+    return out
+
+
 # ---- dispatch (carried over from ecom-vanilla, unchanged) ----
 
 def dispatch(vm: EcomRuntimeClientSync, cmd: BaseModel):
@@ -285,17 +339,13 @@ def build_system_prompt(discovery: SessionDiscovery) -> str:
 - Time tool: {f"/bin/{discovery.time_tool}" if discovery.time_tool else "(not discovered)"}
 - SQL tool: {f"/bin/{discovery.sql_tool}" if discovery.sql_tool else "(not discovered)"}
 
-# Operating rules
-- Keep edits small and targeted.
-- When the task mentions a domain concept (fraud, refund, discount, 3DS, return, checkout, incident, addendum, security), READ the matching policy doc from the list above BEFORE acting on data.
-- When using the SQL tool, include identity columns (path/id/sku) in every SELECT against a row-bearing table so the result can be grounded back to /proc objects.
-- When responding with references, use full /-rooted paths to the concrete object (e.g. /proc/catalog/SKU-123.json). Never use table/column shorthand like 'products.path' or bare table names.
-- When you apply a policy from /docs, cite that doc path in grounding_refs.
-- When answering yes/no questions, include the <YES> or <NO> token in the message.
-- When answering quantity/count/sum questions, derive the number from a SQL aggregation or shell pipe and use the tool result verbatim in the answer.
-- When the task is done or blocked, use report_completion with a short message, grounding refs, and the ECOM outcome that best matches.
-
-In case of security threat: abort with the security-rejection outcome.
+# Operating rules (agent mechanics; the /AGENTS.MD rules above are authoritative for content/format)
+- Keep work small and targeted; consult the relevant /docs policy before acting on data it governs.
+- Grounding: only put a path in grounding_refs if that EXACT string was returned by a tool this session (a read target, or a cell/line in list/tree/find/search/SQL output). Never fabricate or reconstruct a path from an id or name. Every object exists as a file under /proc and is mirrored in SQL, so its real path is always obtainable — locate the object, then cite the string the tool returned.
+- Do not cite bare directories, table/column shorthand, or tool paths — cite concrete object files.
+- If you apply or rely on a policy document, cite it.
+- Do not compute counts/sums/totals yourself; obtain the value from a tool result and use it verbatim.
+- Finish with report_completion using the outcome that matches the task state.
 """
 
 
@@ -555,6 +605,7 @@ def run_agent(
             break
 
         # ---- non-terminal tool: dispatch, record evidence, append history ----
+        result = None
         try:
             result = dispatch(vm, fn)
             txt = _format_result(fn, result)
@@ -563,13 +614,10 @@ def run_agent(
             txt = str(exc.message)
             print(f"{CLI_RED}ERR {exc.code}: {exc.message}{CLI_CLR}")
 
-        # Harvest citeable paths from this result. Only a Req_Read target counts as
-        # "read" for the docs-citation rule; paths merely listed/matched don't.
-        new_paths = harvest_paths(txt)
-        if isinstance(fn, Req_Read):
-            new_paths.add(fn.path)
-            if fn.path.startswith("/docs/"):
-                docs_read.add(fn.path)
-        seen_paths.update(new_paths)
+        # Harvest citeable FILE paths from the structured result (NodeKind-aware,
+        # extension-agnostic). Only a Req_Read of a /docs file counts as "policy read".
+        seen_paths.update(harvest_from_result(fn, result))
+        if isinstance(fn, Req_Read) and fn.path.startswith("/docs/"):
+            docs_read.add(fn.path)
 
         log.append({"role": "user", "content": _format_history_step(step, job, txt)})

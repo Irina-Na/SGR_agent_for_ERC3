@@ -26,6 +26,7 @@ from bitgn.harness_pb2 import (
     StartTrialRequest,
     StatusRequest,
     SubmitRunRequest,
+    TRIAL_STATE_DONE,
 )
 from bitgn.vm.ecom.ecom_connect import EcomRuntimeClientSync
 
@@ -110,7 +111,7 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
         )
 
         run = client.start_run(StartRunRequest(
-            name=f"@Irinai_Na Knowledge Agent v0.2 ({MODEL_ID})",
+            name=f"@Irinai_Na Knowledge Agent v0.2.1 ({MODEL_ID})",
             benchmark_id=BENCH_ID,
             api_key=BITGN_API_KEY,
         ))
@@ -161,7 +162,26 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
                 else:
                     print(f"\n{CLI_BLUE}Score: not available{CLI_CLR}\n")
         finally:
-            client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
+            print(f"\n{CLI_GREEN}>>>> Submitting run... <<<<{CLI_CLR}")
+            result = client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
+
+            if getattr(result, "score_available", False):
+                print(f"FINAL SCORE: {result.score:0.2f}")
+                incomplete = 0
+                for t in result.trials:
+                    if t.state != TRIAL_STATE_DONE:
+                        incomplete += 1
+                        continue
+
+                    style = CLI_GREEN if t.score == 1 else CLI_RED
+                    explain = "\n" + textwrap.indent("\n".join(t.score_detail), "  ") + "\n"
+                    print(f"- {t.task_id}: {style}Score: {t.score:0.2f}{CLI_CLR}{explain}".strip("\n "))
+                    scores.append((t.task_id, t.score))
+
+                if incomplete > 0:
+                    print(f"{CLI_RED}incomplete trials: {incomplete}{CLI_CLR}")
+            else:
+                print(f"\n{CLI_RED}Score is not available. Results are sealed and will be revealed later{CLI_CLR}\n")
 
     except ConnectError as exc:
         print(f"{exc.code}: {exc.message}")
@@ -169,12 +189,7 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
         print(f"{CLI_RED}Interrupted{CLI_CLR}")
 
     if scores:
-        for task_id, score in scores:
-            style = CLI_GREEN if score == 1 else CLI_RED
-            print(f"{task_id}: {style}{score:0.2f}{CLI_CLR}")
-
         total = sum(score for _, score in scores) / len(scores) * 100.0
-        print(f"FINAL: {total:0.2f}%")
         return total
 
     return None

@@ -94,13 +94,15 @@ def _collect_proc_kinds(vm: EcomRuntimeClientSync) -> List[str]:
 
 
 def _collect_docs_paths(vm: EcomRuntimeClientSync) -> List[str]:
+    # Collect every FILE under /docs regardless of extension. Invariant 3 guarantees
+    # /docs exists but not that policy docs are markdown — do not filter by extension.
     result = vm.tree(TreeRequest(root="/docs", level=0))
     paths: List[str] = []
 
     def walk(node, prefix: str) -> None:
         for child in node.children:
             p = f"{prefix}/{child.name}"
-            if child.kind == NodeKind.NODE_KIND_FILE and child.name.endswith(".md"):
+            if child.kind == NodeKind.NODE_KIND_FILE:
                 paths.append(p)
             elif child.kind == NodeKind.NODE_KIND_DIR:
                 walk(child, p)
@@ -146,9 +148,9 @@ Produce a strict structured classification:
 - identity_tool: the /bin leaf name that reports the current user / session identity, or null
 - time_tool: the /bin leaf name that reports current date / time, or null
 - sql_tool: the /bin leaf name that accepts SQL on stdin, or null
-- doc_triggers: for each /docs/*.md path, a short list of domain trigger keywords
-  inferred from the filename and path (e.g. "fraud", "refund", "discount", "3DS",
-  "return", "checkout", "incident", "addendum", "security"). Empty list is acceptable.
+- doc_triggers: for each file under /docs (any type), a short list of domain trigger
+  keywords inferred from the filename and path (e.g. "fraud", "refund", "discount",
+  "3DS", "return", "checkout", "incident", "addendum", "security"). Empty list is acceptable.
 
 Use AGENTS.MD's natural-language descriptions as the primary source of truth.
 """

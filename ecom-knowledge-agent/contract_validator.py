@@ -22,10 +22,8 @@ from api_tools import ReportTaskCompletion
 from ecom_discovery import SessionDiscovery
 
 
-# /-rooted path ending in .json or .md, stopping at whitespace / CSV / quote / bracket delims
-_PATH_RE = re.compile(r"/[^\s,;\"'\]\)\}]+\.(?:json|md)")
-
-# table.column shorthand the grader rejects (e.g. "products.path", "inventory")
+# table.column shorthand the grader rejects (e.g. "products.path", "inventory").
+# Generic: any dotted/bare identifier with no path separator.
 _SHORTHAND_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
 # refusal / denial language (generalized; not tied to a specific policy filename)
@@ -36,16 +34,6 @@ _REFUSAL_TERMS = (
     "refuse", "per our security", "security policy", "against policy",
     "violates policy", "for security reasons",
 )
-
-
-def harvest_paths(*texts: str) -> set[str]:
-    """Extract every /-rooted .json/.md path token from one or more text blobs."""
-    found: set[str] = set()
-    for t in texts:
-        if not t:
-            continue
-        found.update(_PATH_RE.findall(t))
-    return found
 
 
 def _looks_like_refusal(message: str) -> bool:
@@ -81,10 +69,16 @@ def validate_report(
                 f"grounding_ref '{ref}' is {kind}. Cite the concrete /-rooted path "
                 f"from a tool result (e.g. the `path` column value)."
             )
-        elif ref not in known_valid:
+            continue
+        # Allow row/line provenance fragments (e.g. "/archive/x.tsv#row=AR-1"):
+        # validate the underlying file, not the fragment.
+        base = ref.split("#", 1)[0].rstrip("/")
+        if base not in known_valid:
             violations.append(
                 f"grounding_ref '{ref}' was never returned by any tool this trial "
-                f"(possible hallucinated path). Only cite paths that appeared in a read/SQL/tree result."
+                f"(likely fabricated/reconstructed). Every object is a file under /proc and is "
+                f"mirrored in SQL: locate it (read/list/find under /proc, or the SQL column that "
+                f"holds its path) and cite the exact string the tool returned."
             )
 
     # 2. docs-citation: if a policy was applied, require a /docs ref
