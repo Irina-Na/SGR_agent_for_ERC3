@@ -47,7 +47,7 @@ MODEL_ID = os.getenv("MODEL_ID") or (
     "openai/gpt-oss-120b" if PROVIDER == "nebius" else "gpt-4.1-2025-04-14"
 )
 
-_VERSION = "0.3.1"
+_VERSION = "0.4.0"
 try:
     with Path(__file__).with_name("pyproject.toml").open("rb") as _f:
         import tomllib
@@ -109,6 +109,7 @@ def _unique_path(path: Path) -> Path:
 def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
     task_filter = os.sys.argv[1:]
     scores: list[tuple[str, float]] = []
+    final_score: float | None = None
     discovery: Optional[SessionDiscovery] = None
 
     try:
@@ -172,6 +173,7 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
 
             if getattr(result, "score_available", False):
                 print(f"FINAL SCORE: {result.score:0.2f}")
+                final_score = result.score * 100.0
                 incomplete = 0
                 for t in result.trials:
                     if t.state != TRIAL_STATE_DONE:
@@ -179,7 +181,8 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
                         continue
 
                     style = CLI_GREEN if t.score == 1 else CLI_RED
-                    explain = "\n" + textwrap.indent("\n".join(t.score_detail), "  ") + "\n"
+                    detail = getattr(t, "score_detail", ())
+                    explain = "\n" + textwrap.indent("\n".join(detail), "  ") + "\n" if detail else ""
                     print(f"- {t.task_id}: {style}Score: {t.score:0.2f}{CLI_CLR}{explain}".strip("\n "))
                     scores.append((t.task_id, t.score))
 
@@ -193,9 +196,11 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
     except KeyboardInterrupt:
         print(f"{CLI_RED}Interrupted{CLI_CLR}")
 
+    if final_score is not None:
+        return final_score
+
     if scores:
-        total = sum(score for _, score in scores) / len(scores) * 100.0
-        return total
+        return sum(score for _, score in scores) / len(scores) * 100.0
 
     return None
 

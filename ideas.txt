@@ -4,9 +4,57 @@
 
 Kimi 2.6  в отличие от 4 дипсика, с приличной скоростью + 38 сходу без проблем там, где квен брала 34-37 в лучшем случае
 
+
+1.
+Please take attention what everything can be changed in prod environment.
+
+Only what we know is:
+
 Что точно останется:
 
 (1) AGENTS.md в корне и правило (которое он упоминает), что дальше в папках лежат readme.
 (2) утилиты в /bin 
 (3) правило, что при запуске надо сделать tree на /docs
 (4) объекты/сущности будут лежать в proc/ и дублироваться в sql
+
+Please correct the plan base on it
+
+2.
+
+I've re-run benchmark to measure delta . You can see full log here
+ecom-knowledge-agent\runs\20260528_182854_Qwen_Qwen3.5-397B-A17B-fast_score_na_gitadccbff.log
+But be carefull - the log file is too long.
+
+
+
+3.
+
+could you provide statistics of types  errors  as you do befor 
+
+Excellent result — 37.01% vs the 8.51% Qwen baseline, with 17/50 perfect. The discovery + grounding-ref reversal alone did that. More importantly, the failures cluster almost exactly into the buckets the planned contract mechanisms target:
+
+Failure breakdown (33 non-perfect)
+Bucket	Tasks	Count	Fixed by
+Missing /docs/…md policy citation	t09,t10,t11,t12,t25,t26,t35,t41,t46,t50	10	Policy-discovery preflight (§F domain-trigger) + gate policy-citation check (§E.3)
+Invalid /proc/…json reference (hallucinated/wrong path)	t13,t14,t15,t24,t28,t30,t34,t42	8	Evidence ledger + gate evidence-presence check (§E.2)
+Missing required /proc/…json reference	t16,t47	2	Evidence ledger + required_ref_kinds
+No-detail zeros (wrong answer / outcome mismatch)	t29,t36,t38,t39,t40,t49	6	Need per-task inspection; some likely outcome-advisor (§D)
+Structured-output fail ("no answer", retry exhausted)	t45	1	Fallback envelope (§H)
+Partial credit	t19(.60),t20(.60),t48(.31)	3	Mix — partial grounding
+~20 of 33 failures are pure grounding/citation drift (missing /docs cite + invalid /proc ref + missing /proc ref). That's the single biggest lever, and it's exactly what the evidence ledger + finalization gate layer fixes deterministically:
+
+Ledger records every path actually seen in Req_Read/SQL results → gate rejects report_completion whose grounding_refs aren't in the ledger (kills the 8 "invalid reference" tasks).
+Domain-trigger preflight auto-reads the matching /docs/…md and the gate requires it be cited when policy was applied (kills most of the 10 "missing /docs" tasks).
+Also notable: t38/t39/t40 each ran ~1,700 log lines — the agent looped near the 30-step cap. Worth checking if they hit the limit or just did a lot of work.
+
+Recommendation: build the evidence ledger + finalization gate next (contract_validator.py + wiring in agent.py's my_dispatch/loop). Highest ROI — plausibly converts 15+ of these to passing. The policy-citation half rides along with it.
+
+Want me to implement that layer? I'd also quickly inspect t38/t39/t40 and one no-detail zero (t29) first so the gate design accounts for what those are actually doing.
+
+
+like this?
+
+
+4. 
+
+Knowing that this rule is matters there: Hardcode nothing a prod swap can rotate./AGENTS.MD at the root, and its stated rule that further instructions/readmes live deeper in folders. And we should choose change the arhitecrure so it can work universal way and any customization (especially prompt customization) should be done on runtime (for example, offer not hardcoded rule for certian task, but a pipeline or agent or machine for collecting custom prompt for every task)

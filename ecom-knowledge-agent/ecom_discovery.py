@@ -37,8 +37,11 @@ class SessionDiscovery(BaseModel):
     docs_tree_text: str = ""
     proc_tree_text: str = ""
 
-    # populated lazily on first SQL call (not by discover())
-    identity_columns: Dict[str, List[str]] = Field(default_factory=dict)
+    # Identity map for the Path Resolver, built lazily on first finalization-gate
+    # use and memoized run-scoped: {table: {"path_col": str, "cols": [str, ...]}}.
+    # Schema-agnostic — discovered by sampling, never hardcoded (see prime directive).
+    identity_columns: Dict[str, dict] = Field(default_factory=dict)
+    identity_built: bool = False
 
 
 # ---- structured-output schema for the one LLM classification call ----

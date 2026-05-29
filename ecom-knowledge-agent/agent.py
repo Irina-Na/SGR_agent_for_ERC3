@@ -40,6 +40,7 @@ from api_tools import (
 from ecom_runtime import EcomRuntime
 from ecom_discovery import SessionDiscovery, discover
 from contract_validator import validate_report
+from resolvers import repair_grounding_refs
 
 
 MAX_VALIDATION_RETRIES = 3
@@ -519,6 +520,11 @@ def run_agent(
 
         # ---- Finalization gate: validate report_completion before submitting ----
         if isinstance(fn, ReportTaskCompletion):
+            # Repair before reject: resolve bare-id / unseen-path refs to real
+            # object paths via SQL. Resolved paths enter rt.paths through the
+            # wrapper ledger, so the gate below then accepts them.
+            for correction in repair_grounding_refs(rt, discovery, fn):
+                print(f"{CLI_BLUE}{correction}{CLI_CLR}")
             violations = validate_report(fn, rt.paths, discovery, rt.docs_read)
             if violations and validation_retries < MAX_VALIDATION_RETRIES:
                 validation_retries += 1
