@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shlex
 import time
 from pathlib import Path
@@ -27,34 +26,18 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from bitgn.vm.ecom.ecom_connect import EcomRuntimeClientSync
-from bitgn.vm.ecom.ecom_pb2 import (
-    AnswerRequest,
-    DeleteRequest,
-    ExecRequest,
-    FindRequest,
-    ListRequest,
-    NodeKind,
-    ReadRequest,
-    SearchRequest,
-    StatRequest,
-    TreeRequest,
-    WriteRequest,
-)
+from bitgn.vm.ecom.ecom_pb2 import NodeKind
 
 from api_tools import (
     NextStep,
-    OUTCOME_BY_NAME,
-    Req_Delete,
     Req_Exec,
-    Req_Find,
     Req_List,
     Req_Read,
     Req_Search,
-    Req_Stat,
     Req_Tree,
-    Req_Write,
     ReportTaskCompletion,
 )
+from ecom_runtime import EcomRuntime
 from ecom_discovery import SessionDiscovery, discover
 from contract_validator import validate_report
 
@@ -206,97 +189,6 @@ def _format_result(cmd: BaseModel, result) -> str:
     if isinstance(cmd, Req_Exec):
         return _format_exec_response(cmd, result)
     return json.dumps(MessageToDict(result), indent=2)
-
-
-# ---- evidence harvesting from STRUCTURED results (NodeKind-aware, extension-agnostic) ----
-
-# /-rooted token for exec/SQL stdout. No extension requirement: SQL `path` cells are
-# citeable regardless of extension. Over-capture here only relaxes the gate (avoids
-# false rejection); bare-dir protection stays on the structured FILE-kind tools below.
-_EXEC_PATH_RE = re.compile(r"/[^\s,;\"'\]\)\}#]+")
-
-
-def _join(base: str, name: str) -> str:
-    return (base.rstrip("/") + "/" + name) if base not in ("", "/") else "/" + name
-
-
-def _walk_tree_files(node, cur_path: str, out: set[str]) -> None:
-    for child in node.children:
-        child_path = _join(cur_path, child.name)
-        if child.kind == NodeKind.NODE_KIND_FILE:
-            out.add(child_path)
-        elif child.kind == NodeKind.NODE_KIND_DIR:
-            _walk_tree_files(child, child_path, out)
-
-
-def harvest_from_result(cmd: BaseModel, result) -> set[str]:
-    """Extract citeable FILE paths from a structured RPC result.
-
-    Uses the runtime's own NodeKind (FILE vs DIR) where available, so it survives
-    a change in object-path extensions in prod. Directories and tool paths are
-    never added (they aren't FILE nodes and don't appear as SQL path cells)."""
-    out: set[str] = set()
-    if result is None:
-        return out
-    if isinstance(cmd, Req_Read):
-        out.add(cmd.path)
-    elif isinstance(cmd, Req_Tree):
-        _walk_tree_files(result.root, cmd.root or "/", out)
-    elif isinstance(cmd, Req_List):
-        for e in result.entries:
-            if e.kind == NodeKind.NODE_KIND_FILE:
-                out.add(_join(cmd.path or "/", e.name))
-    elif isinstance(cmd, Req_Search):
-        for m in result.matches:
-            out.add(m.path)
-    elif isinstance(cmd, Req_Exec):
-        out.update(_EXEC_PATH_RE.findall(getattr(result, "stdout", "") or ""))
-    elif isinstance(cmd, Req_Find):
-        # FindResponse shape not asserted here; harvest /-rooted tokens from the
-        # serialized result (permissive — only relaxes the gate).
-        try:
-            out.update(_EXEC_PATH_RE.findall(json.dumps(MessageToDict(result))))
-        except Exception:
-            pass
-    return out
-
-
-# ---- dispatch (carried over from ecom-vanilla, unchanged) ----
-
-def dispatch(vm: EcomRuntimeClientSync, cmd: BaseModel):
-    if isinstance(cmd, Req_Tree):
-        return vm.tree(TreeRequest(root=cmd.root, level=cmd.level))
-    if isinstance(cmd, Req_Find):
-        kind_map = {
-            "all": NodeKind.NODE_KIND_UNSPECIFIED,
-            "files": NodeKind.NODE_KIND_FILE,
-            "dirs": NodeKind.NODE_KIND_DIR,
-        }
-        return vm.find(FindRequest(root=cmd.root, name=cmd.name, kind=kind_map[cmd.kind], limit=cmd.limit))
-    if isinstance(cmd, Req_Search):
-        return vm.search(SearchRequest(root=cmd.root, pattern=cmd.pattern, limit=cmd.limit))
-    if isinstance(cmd, Req_List):
-        return vm.list(ListRequest(path=cmd.path))
-    if isinstance(cmd, Req_Read):
-        return vm.read(ReadRequest(
-            path=cmd.path, number=cmd.number,
-            start_line=cmd.start_line, end_line=cmd.end_line,
-        ))
-    if isinstance(cmd, Req_Write):
-        return vm.write(WriteRequest(path=cmd.path, content=cmd.content))
-    if isinstance(cmd, Req_Delete):
-        return vm.delete(DeleteRequest(path=cmd.path))
-    if isinstance(cmd, Req_Stat):
-        return vm.stat(StatRequest(path=cmd.path))
-    if isinstance(cmd, Req_Exec):
-        return vm.exec(ExecRequest(path=cmd.path, args=cmd.args, stdin=cmd.stdin))
-    if isinstance(cmd, ReportTaskCompletion):
-        return vm.answer(AnswerRequest(
-            message=cmd.message,
-            outcome=OUTCOME_BY_NAME[cmd.outcome],
-            refs=cmd.grounding_refs,
-        ))
-    raise ValueError(f"Unknown command: {cmd}")
 
 
 # ---- LLM client (identical to ecom-vanilla) ----
@@ -451,8 +343,15 @@ def _coerce_next_step(candidate: str):
         }
 
     plan = obj.get("plan_remaining_steps_brief")
-    if isinstance(plan, list) and len(plan) > 5:
+    if not isinstance(plan, list) or len(plan) == 0:
+        obj["plan_remaining_steps_brief"] = ["continue"]
+    elif len(plan) > 5:
         obj["plan_remaining_steps_brief"] = plan[:5]
+
+    # clamp out-of-range function args (find/search cap limit at 20)
+    fn = obj.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("limit"), int) and fn["limit"] > 20:
+        fn["limit"] = 20
 
     obj.setdefault("task_completed", False)
     return obj
@@ -579,6 +478,8 @@ def run_agent(
         print(f"{CLI_BLUE}Discovery (trial-scoped fallback)...{CLI_CLR}")
         discovery = discover(vm, client, model)
 
+    rt = EcomRuntime(vm, sql_tool=discovery.sql_tool)
+
     log = [{"role": "system", "content": build_json_system_prompt(discovery)}]
 
     # Bootstrap: identity + time per trial (date/id vary per simulation).
@@ -591,7 +492,7 @@ def run_agent(
 
     for cmd in must:
         try:
-            result = dispatch(vm, cmd)
+            result = rt.execute(cmd)
             formatted = _format_result(cmd, result)
             print(f"{CLI_GREEN}AUTO{CLI_CLR}: {formatted}")
             log.append({"role": "user", "content": formatted})
@@ -600,9 +501,8 @@ def run_agent(
 
     log.append({"role": "user", "content": task_text})
 
-    # Evidence ledger: paths observed in tool results this trial; docs actually read.
-    seen_paths: set[str] = set()
-    docs_read: set[str] = set()
+    # Evidence ledger lives inside the runtime (rt.paths / rt.docs_read), populated
+    # on every wrapper call — robust to output-format changes.
     validation_retries = 0
 
     for i in range(30):
@@ -619,7 +519,7 @@ def run_agent(
 
         # ---- Finalization gate: validate report_completion before submitting ----
         if isinstance(fn, ReportTaskCompletion):
-            violations = validate_report(fn, seen_paths, discovery, docs_read)
+            violations = validate_report(fn, rt.paths, discovery, rt.docs_read)
             if violations and validation_retries < MAX_VALIDATION_RETRIES:
                 validation_retries += 1
                 msg = "VALIDATION_FAILED (do not resubmit unchanged):\n- " + "\n- ".join(violations)
@@ -628,7 +528,7 @@ def run_agent(
                 continue
             # accept (passed, or retry budget exhausted) → submit the answer
             try:
-                dispatch(vm, fn)
+                rt.execute(fn)
             except ConnectError as exc:
                 print(f"{CLI_RED}ERR {exc.code}: {exc.message}{CLI_CLR}")
             status = CLI_GREEN if fn.outcome == "OUTCOME_OK" else CLI_YELLOW
@@ -640,20 +540,13 @@ def run_agent(
                 print(f"- {CLI_BLUE}{ref}{CLI_CLR}")
             break
 
-        # ---- non-terminal tool: dispatch, record evidence, append history ----
-        result = None
+        # ---- non-terminal tool: execute (records evidence inside rt), append history ----
         try:
-            result = dispatch(vm, fn)
+            result = rt.execute(fn)
             txt = _format_result(fn, result)
             print(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
         except ConnectError as exc:
             txt = str(exc.message)
             print(f"{CLI_RED}ERR {exc.code}: {exc.message}{CLI_CLR}")
-
-        # Harvest citeable FILE paths from the structured result (NodeKind-aware,
-        # extension-agnostic). Only a Req_Read of a /docs file counts as "policy read".
-        seen_paths.update(harvest_from_result(fn, result))
-        if isinstance(fn, Req_Read) and fn.path.startswith("/docs/"):
-            docs_read.add(fn.path)
 
         log.append({"role": "user", "content": _format_history_step(step, job, txt)})
