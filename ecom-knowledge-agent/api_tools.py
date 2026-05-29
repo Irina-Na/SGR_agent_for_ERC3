@@ -98,7 +98,7 @@ class NextStep(BaseModel):
         ...,
         description="briefly explain the next useful steps",
     )
-    task_completed: bool
+    task_completed: bool = False
     function: Union[
         ReportTaskCompletion,
         Req_Tree,

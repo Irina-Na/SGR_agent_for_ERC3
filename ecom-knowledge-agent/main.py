@@ -22,6 +22,7 @@ from bitgn.harness_pb2 import (
     EndTrialRequest,
     EvalPolicy,
     GetBenchmarkRequest,
+    GetRunRequest,
     StartRunRequest,
     StartTrialRequest,
     StatusRequest,
@@ -45,6 +46,15 @@ PROVIDER = os.getenv("PROVIDER") or "nebius"  # "nebius" or "openai"
 MODEL_ID = os.getenv("MODEL_ID") or (
     "openai/gpt-oss-120b" if PROVIDER == "nebius" else "gpt-4.1-2025-04-14"
 )
+
+_VERSION = "0.3.1"
+try:
+    with Path(__file__).with_name("pyproject.toml").open("rb") as _f:
+        import tomllib
+        _VERSION = tomllib.load(_f).get("project", {}).get("version", _VERSION_DEFAULT)
+except Exception:
+    pass
+VERSION = _VERSION
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
@@ -111,7 +121,7 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
         )
 
         run = client.start_run(StartRunRequest(
-            name=f"@Irinai_Na Knowledge Agent v0.2.1 ({MODEL_ID})",
+            name=f"@Irinai_Na Knowledge Agent v{VERSION} ({MODEL_ID})",
             benchmark_id=BENCH_ID,
             api_key=BITGN_API_KEY,
         ))
@@ -153,17 +163,12 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
                 except Exception as exc:
                     print(exc)
 
-                result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
-                if result.score_available:
-                    scores.append((trial.task_id, result.score))
-                    style = CLI_GREEN if result.score == 1 else CLI_RED
-                    explain = textwrap.indent("\n".join(result.score_detail), "  ")
-                    print(f"\n{style}Score: {result.score:0.2f}\n{explain}\n{CLI_CLR}")
-                else:
-                    print(f"\n{CLI_BLUE}Score: not available{CLI_CLR}\n")
+                client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
+                print(f"\n{CLI_BLUE}Trial closed; score will be printed after run submit{CLI_CLR}\n")
         finally:
             print(f"\n{CLI_GREEN}>>>> Submitting run... <<<<{CLI_CLR}")
-            result = client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
+            client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
+            result = client.get_run(GetRunRequest(run_id=run.run_id))
 
             if getattr(result, "score_available", False):
                 print(f"FINAL SCORE: {result.score:0.2f}")

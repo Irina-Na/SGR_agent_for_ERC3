@@ -426,6 +426,38 @@ def _format_history_step(step: str, job: NextStep, result_text: str) -> str:
     )
 
 
+def _coerce_next_step(candidate: str):
+    """Phase-0 deterministic repair of common schema-shape mistakes.
+
+    Returns a repaired dict on success, or None if the candidate isn't parseable
+    JSON (caller falls back to model_validate_json so the ValidationError path is
+    preserved). Repairs: bare inner-function dict, over-length plan, missing
+    task_completed.
+    """
+    try:
+        obj = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+
+    # bare function dict (has `tool`, no `current_state`) → wrap in NextStep
+    if "tool" in obj and "current_state" not in obj and "function" not in obj:
+        obj = {
+            "current_state": "(recovered)",
+            "plan_remaining_steps_brief": ["continue"],
+            "task_completed": False,
+            "function": obj,
+        }
+
+    plan = obj.get("plan_remaining_steps_brief")
+    if isinstance(plan, list) and len(plan) > 5:
+        obj["plan_remaining_steps_brief"] = plan[:5]
+
+    obj.setdefault("task_completed", False)
+    return obj
+
+
 def query_next_step_json(
     client: OpenAI,
     model: str,
@@ -459,7 +491,11 @@ def query_next_step_json(
             content = raw_message.content or ""
             candidate = extract_json_candidate(content)
             try:
-                parsed = NextStep.model_validate_json(candidate)
+                coerced = _coerce_next_step(candidate)
+                if coerced is not None:
+                    parsed = NextStep.model_validate(coerced)
+                else:
+                    parsed = NextStep.model_validate_json(candidate)
                 attempts.append({
                     "attempt": attempt_num,
                     "elapsed_ms": elapsed_ms,
