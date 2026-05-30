@@ -39,9 +39,10 @@ from api_tools import (
 )
 from ecom_runtime import EcomRuntime
 from ecom_discovery import SessionDiscovery, discover
-from contract_validator import validate_report
+from contract_validator import sanitize_grounding_refs, validate_report
 from resolvers import repair_grounding_refs
-from task_framing import format_framing_diag, frame_task, refresh_docs_for_trial
+from policy_collector import collect_task_policies, format_policy_collection_diag
+from task_framing import refresh_docs_for_trial
 
 
 MAX_VALIDATION_RETRIES = 3
@@ -549,53 +550,37 @@ def run_agent(
     if discovery.identity_tool:
         must.append(Req_Exec(tool="exec", path=f"/bin/{discovery.identity_tool}"))
 
+    runtime_context: list[str] = []
     for cmd in must:
         try:
             result = rt.execute(cmd)
             formatted = _format_result(cmd, result)
             print(f"{CLI_GREEN}AUTO{CLI_CLR}: {formatted}")
             log.append({"role": "user", "content": formatted})
+            runtime_context.append(formatted)
         except ConnectError as exc:
             print(f"{CLI_YELLOW}AUTO {cmd.path} failed (continuing): {exc.message}{CLI_CLR}")
 
     log.append({"role": "user", "content": task_text})
 
-    # Task-framing pre-step: surface the /docs policy that GOVERNS this task (if any)
-    # up front, so the agent works with the authoritative grain/filters/format from
-    # step 1 instead of reasoning from the schema. Degrades to no-op when none matches.
-    # Part A item 1: refresh /docs from THIS trial (run-hoisted snapshot can drift).
+    # Policy collection pre-step: inject bounded runtime-selected /docs material.
+    # Scoped-but-relevant docs are retained as candidates instead of being
+    # dropped before the agent can inspect them.
     trial_discovery = refresh_docs_for_trial(rt, discovery)
     drift = len(trial_discovery.docs_tree) - len(discovery.docs_tree)
-    framing = frame_task(task_text, trial_discovery, client, model)
-    paths = framing.governing_doc_paths
-    if len(paths) == 1 and framing.confident:
-        ladder = "authoritative"
-        p = paths[0]
-        try:
-            content = rt.read(Req_Read(tool="read", path=p)).content
-            print(f"{CLI_BLUE}FRAMING: governing policy {p}{CLI_CLR}")
-            log.append({"role": "user", "content": (
-                f"# GOVERNING POLICY for this task (authoritative — apply its exact "
-                f"definition, grain, filters, and output format; it overrides any "
-                f"default interpretation): {p}\n{content}"
-            )})
-        except ConnectError as exc:
-            print(f"{CLI_YELLOW}FRAMING: could not read {p}: {exc.message}{CLI_CLR}")
-            ladder = "none"  # injection failed → degrade
-    elif paths:
-        ladder = "candidates"
-        print(f"{CLI_BLUE}FRAMING: {len(paths)} candidate policies (ambiguous scope){CLI_CLR}")
-        listing = "\n".join(f"- {p}" for p in paths)
-        log.append({"role": "user", "content": (
-            "# CANDIDATE POLICIES — more than one may govern this task. Determine which "
-            "scope (e.g. location/time/workflow) the task actually requires, then read "
-            "and apply that one before answering:\n" + listing
-        )})
-    else:
-        ladder = "none"
-    # Part A item 2: always emit one diagnostic line (miss or hit). Coverage metric
-    # (item 3) is computed by grepping these lines across a run — see plan §2.
-    print(format_framing_diag(framing, len(trial_discovery.docs_tree), ladder, drift))
+    collection = collect_task_policies(
+        task_text,
+        trial_discovery,
+        rt,
+        client,
+        model,
+        runtime_context="\n\n".join(runtime_context),
+    )
+    if collection.injected_context:
+        selected_count = len(collection.authoritative_docs) + len(collection.candidate_docs)
+        print(f"{CLI_BLUE}POLICY: injected {selected_count} runtime-selected docs{CLI_CLR}")
+        log.append({"role": "user", "content": collection.injected_context})
+    print(format_policy_collection_diag(collection, len(trial_discovery.docs_tree), drift))
 
     # Evidence ledger lives inside the runtime (rt.paths / rt.docs_read), populated
     # on every wrapper call — robust to output-format changes.
@@ -628,6 +613,9 @@ def run_agent(
                 log.append({"role": "user", "content": msg})
                 continue
             # accept (passed, or retry budget exhausted) → submit the answer
+            fn, dropped = sanitize_grounding_refs(fn, rt.paths, discovery)
+            if dropped:
+                print(f"{CLI_YELLOW}sanitize: dropped non-path grounding_refs: {dropped}{CLI_CLR}")
             try:
                 rt.execute(fn)
             except ConnectError as exc:

@@ -1,8 +1,0 @@
-Logging to C:\Users\Ironia\PycharmProjects\ERC3\erc3-agents\ecom-knowledge-agent\runs\20260530_095328_Qwen_Qwen3.5-397B-A17B-fast_gitf3ec74a.log
-LLM traces to C:\Users\Ironia\PycharmProjects\ERC3\erc3-agents\ecom-knowledge-agent\runs\traces\20260530_095328_Qwen_Qwen3.5-397B-A17B-fast_gitf3ec74a_<task>_step_<n>.json
-Connecting to BitGN status: "ok"
-version: "v2"
-
-EVAL_POLICY_OPEN benchmark: bitgn/ecom1-dev with 53 tasks.
-[32mECOM1 is an ecommerce OS runtime scaffold. This dev benchmark exercises catalogue lookup, inventory reasoning with store coverage, policy-source authority, basket checkout authorization, discount role authorization with active addenda, 3DS payment recovery and refusal, return refund approval/finalization and refusal, archived payment fraud review, runtime-tool incident recovery, and deterministic filesystem/action grading.[0m
-[34m=== Bootstrapping discovery on t09 ===[0m

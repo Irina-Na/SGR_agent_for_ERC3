@@ -36,14 +36,13 @@ from bitgn.vm.ecom.ecom_connect import EcomRuntimeClientSync
 from answer_check import check_answer
 from api_tools import Req_Exec, ReportTaskCompletion
 from code_executor import ExecOutcome, run_script
-from contract_validator import validate_report
+from contract_validator import sanitize_grounding_refs, validate_report
 from ecom_discovery import SessionDiscovery, discover
 from ecom_runtime import EcomRuntime
+from policy_collector import collect_task_policies, format_policy_collection_diag
 from resolvers import repair_grounding_refs
 from task_framing import (
-    format_framing_diag,
     format_schema_diag,
-    frame_task,
     refresh_docs_for_trial,
     refresh_schema_for_trial,
 )
@@ -147,6 +146,12 @@ Runtime — the ONLY I/O surface is `rt.*` (these exact methods, nothing else ex
   rt.paths                                     # frozenset of /-rooted paths SEEN this trial
 Do NOT invent methods (no `rt.list_tree`, no `rt.schema`, no `rt.query`). If a
 helper you want doesn't appear above, compose the same effect from what does.
+
+Inspect mode is tolerant of missing optional filesystem paths: if `rt.read`,
+`rt.list`, or `rt.tree` targets a path that is absent in this trial, it returns an
+empty object instead of aborting. Treat empty content/entries/children as "not
+present" and continue with schema/SQL or the current `/docs` tree. Do not assume
+doc-internal path mentions exist unless the current trial's tools confirm them.
 
 Good inspect script shape:
   1. Reflect the schema with `rt.sql_raw("SELECT ... FROM sqlite_schema ...")`
@@ -436,50 +441,36 @@ def run_agent_coding(
         must.append(Req_Exec(tool="exec", path=f"/bin/{discovery.time_tool}"))
     if discovery.identity_tool:
         must.append(Req_Exec(tool="exec", path=f"/bin/{discovery.identity_tool}"))
+    runtime_context: list[str] = []
     for cmd in must:
         try:
             result = rt.execute(cmd)
             formatted = _format_result(cmd, result)
             print(f"{CLI_GREEN}AUTO{CLI_CLR}: {formatted}")
             preamble.append({"role": "user", "content": formatted})
+            runtime_context.append(formatted)
         except ConnectError as exc:
             print(f"{CLI_YELLOW}AUTO {cmd.path} failed (continuing): {exc.message}{CLI_CLR}")
 
     preamble.append({"role": "user", "content": task_text})
 
-    # Framing pre-step — surface governing /docs policy. Same flow as before,
-    # but the framing message now lives in `preamble` so both phases see it.
+    # Policy collection pre-step. The injected context lives in `preamble`, so
+    # both Inspect and Answer phases see the same runtime-selected /docs content.
     trial_discovery = refresh_docs_for_trial(rt, discovery)
     drift = len(trial_discovery.docs_tree) - len(discovery.docs_tree)
-    framing = frame_task(task_text, trial_discovery, client, model)
-    paths = framing.governing_doc_paths
-    if len(paths) == 1 and framing.confident:
-        ladder = "authoritative"
-        p = paths[0]
-        try:
-            content = rt.read(__import_req_read(p)).content
-            print(f"{CLI_BLUE}FRAMING: governing policy {p}{CLI_CLR}")
-            preamble.append({"role": "user", "content": (
-                f"# GOVERNING POLICY for this task (authoritative — apply its "
-                f"exact definition, grain, filters, and output format; it "
-                f"overrides any default interpretation): {p}\n{content}"
-            )})
-        except ConnectError as exc:
-            print(f"{CLI_YELLOW}FRAMING: could not read {p}: {exc.message}{CLI_CLR}")
-            ladder = "none"
-    elif paths:
-        ladder = "candidates"
-        print(f"{CLI_BLUE}FRAMING: {len(paths)} candidate policies (ambiguous scope){CLI_CLR}")
-        listing = "\n".join(f"- {p}" for p in paths)
-        preamble.append({"role": "user", "content": (
-            "# CANDIDATE POLICIES — more than one may govern this task. "
-            "Determine which scope (e.g. location/time/workflow) the task "
-            "actually requires, then read and apply that one before answering:\n"
-            + listing
-        )})
-    else:
-        ladder = "none"
-    print(format_framing_diag(framing, len(trial_discovery.docs_tree), ladder, drift))
+    collection = collect_task_policies(
+        task_text,
+        trial_discovery,
+        rt,
+        client,
+        model,
+        runtime_context="\n\n".join(runtime_context),
+    )
+    if collection.injected_context:
+        selected_count = len(collection.authoritative_docs) + len(collection.candidate_docs)
+        print(f"{CLI_BLUE}POLICY: injected {selected_count} runtime-selected docs{CLI_CLR}")
+        preamble.append({"role": "user", "content": collection.injected_context})
+    print(format_policy_collection_diag(collection, len(trial_discovery.docs_tree), drift))
 
     # Trial-scoped schema refresh — schema is in the base system prompt from
     # the run-scoped baseline, so we only inject a separate user message when
@@ -526,6 +517,7 @@ def run_agent_coding(
             script, rt,
             timeout_sec=INSPECT_TIMEOUT_SEC,
             wrapper_budget=INSPECT_WRAPPER_BUDGET,
+            tolerate_not_found=True,
         )
         if not outcome.ok:
             print(f"{CLI_YELLOW}inspect error: {outcome.error}{CLI_CLR}")
@@ -682,6 +674,9 @@ def run_agent_coding(
                 pass  # fall back to the model's report if synthesizing fails
 
         # accept (or revise budget exhausted, or abort with synthetic report) — submit.
+        report, dropped = sanitize_grounding_refs(report, rt.paths, discovery)
+        if dropped:
+            print(f"{CLI_YELLOW}sanitize: dropped non-path grounding_refs: {dropped}{CLI_CLR}")
         try:
             rt.execute(report)
         except ConnectError as exc:
@@ -698,6 +693,9 @@ def run_agent_coding(
     if last_report is not None:
         print(f"{CLI_RED}coding executor: exhausted retries; submitting last viable "
               f"candidate rather than forfeiting the trial{CLI_CLR}")
+        last_report, dropped = sanitize_grounding_refs(last_report, rt.paths, discovery)
+        if dropped:
+            print(f"{CLI_YELLOW}sanitize: dropped non-path grounding_refs: {dropped}{CLI_CLR}")
         try:
             rt.execute(last_report)
         except ConnectError as exc:
@@ -709,10 +707,3 @@ def run_agent_coding(
         return
 
     print(f"{CLI_RED}coding executor: exhausted retries with no viable candidate to submit{CLI_CLR}")
-
-
-def __import_req_read(path: str):
-    """Late-binding factory so the framing read inside this module mirrors what
-    agent.py does without an import cycle."""
-    from api_tools import Req_Read
-    return Req_Read(tool="read", path=path)

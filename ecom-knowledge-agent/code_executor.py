@@ -34,7 +34,10 @@ import json as _json
 import re as _re
 import threading
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Optional
+
+from connectrpc.errors import ConnectError
 
 from api_tools import (
     Req_Exec, Req_Find, Req_List, Req_Read, Req_Search, Req_Tree,
@@ -209,13 +212,20 @@ class _BudgetedRuntime:
     underlying rt remains the only I/O surface, so evidence-ledger capture
     and the gate work identically to the step loop."""
 
-    def __init__(self, rt, budget: int, cancel: threading.Event):
+    def __init__(
+        self,
+        rt,
+        budget: int,
+        cancel: threading.Event,
+        tolerate_not_found: bool = False,
+    ):
         # use slot-like attrs prefixed with _ so AST screen's dunder/private
         # block prevents the script from poking at them (rt._rt etc.).
         # (Even if it tried, the AST screen rejects underscore attrs above.)
         object.__setattr__(self, "_rt", rt)
         object.__setattr__(self, "_remaining", budget)
         object.__setattr__(self, "_cancel", cancel)
+        object.__setattr__(self, "_tolerate_not_found", tolerate_not_found)
 
     def _check(self, name: str) -> None:
         if self._cancel.is_set():
@@ -224,19 +234,54 @@ class _BudgetedRuntime:
             raise SandboxError(f"wrapper-call budget exhausted at rt.{name}()")
         object.__setattr__(self, "_remaining", self._remaining - 1)
 
+    def _not_found(self, exc: Exception) -> bool:
+        if not self._tolerate_not_found:
+            return False
+        if isinstance(exc, ConnectError):
+            return "not found" in (getattr(exc, "message", "") or "").lower()
+        return "not found" in str(exc).lower()
+
+    def _empty_read(self, path: str):
+        return SimpleNamespace(content="", truncated=False, missing=True, path=path)
+
+    def _empty_list(self, path: str):
+        return SimpleNamespace(entries=[], truncated=False, missing=True, path=path)
+
+    def _empty_tree(self, root: str):
+        return SimpleNamespace(
+            root=SimpleNamespace(name=(root or "/").rstrip("/") or "/", children=[]),
+            truncated=False,
+            missing=True,
+        )
+
     # one method per typed wrapper; primitive args (script can't construct Req_*)
     def read(self, path: str, number: bool = False, start_line: int = 0, end_line: int = 0):
         self._check("read")
-        return self._rt.read(Req_Read(tool="read", path=path, number=number,
-                                      start_line=start_line, end_line=end_line))
+        try:
+            return self._rt.read(Req_Read(tool="read", path=path, number=number,
+                                          start_line=start_line, end_line=end_line))
+        except Exception as exc:
+            if self._not_found(exc):
+                return self._empty_read(path)
+            raise
 
     def list(self, path: str = "/"):
         self._check("list")
-        return self._rt.list(Req_List(tool="list", path=path))
+        try:
+            return self._rt.list(Req_List(tool="list", path=path))
+        except Exception as exc:
+            if self._not_found(exc):
+                return self._empty_list(path)
+            raise
 
     def tree(self, root: str = "", level: int = 2):
         self._check("tree")
-        return self._rt.tree(Req_Tree(tool="tree", root=root, level=level))
+        try:
+            return self._rt.tree(Req_Tree(tool="tree", root=root, level=level))
+        except Exception as exc:
+            if self._not_found(exc):
+                return self._empty_tree(root)
+            raise
 
     def find(self, name: str, root: str = "/", kind: str = "all", limit: int = 10):
         self._check("find")
@@ -306,6 +351,7 @@ def run_script(
     rt,
     timeout_sec: float = 30.0,
     wrapper_budget: int = 60,
+    tolerate_not_found: bool = False,
 ) -> ExecOutcome:
     """Sandbox-execute a model-written script against the runtime.
 
@@ -324,7 +370,12 @@ def run_script(
     timer.daemon = True
     timer.start()
 
-    proxy = _BudgetedRuntime(rt, wrapper_budget, cancel)
+    proxy = _BudgetedRuntime(
+        rt,
+        wrapper_budget,
+        cancel,
+        tolerate_not_found=tolerate_not_found,
+    )
     stdout_buf = _io.StringIO()
     # Per-call `print` writes into the local buffer instead of the real stdout
     # so the Inspect phase can pipe the model's observations into the next LLM

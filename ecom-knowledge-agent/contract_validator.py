@@ -47,6 +47,35 @@ def _is_docs_path(path: str, docs_tree: Iterable[str]) -> bool:
     return path in set(docs_tree)
 
 
+def sanitize_grounding_refs(
+    report: ReportTaskCompletion,
+    seen_paths: set[str],
+    discovery: SessionDiscovery,
+) -> tuple[ReportTaskCompletion, list[str]]:
+    """Strip refs that cannot be valid /-rooted paths the grader will accept.
+
+    Removes refs that don't start with '/' (markdown headings, table shorthand,
+    free text the model lifted from doc content). Keeps everything else — the
+    full validity check stays in `validate_report` and the gate's retry loop;
+    this is the last-mile guard for when retry budgets exhaust and a report
+    would otherwise ship with structurally-invalid refs.
+
+    Returns (sanitized_report, dropped_refs). When nothing was dropped, the
+    original report instance is returned unchanged.
+    """
+    refs = list(report.grounding_refs or [])
+    kept: list[str] = []
+    dropped: list[str] = []
+    for ref in refs:
+        if isinstance(ref, str) and ref.startswith("/"):
+            kept.append(ref)
+        else:
+            dropped.append(ref)
+    if not dropped:
+        return report, []
+    return report.model_copy(update={"grounding_refs": kept}), dropped
+
+
 def validate_report(
     report: ReportTaskCompletion,
     seen_paths: set[str],

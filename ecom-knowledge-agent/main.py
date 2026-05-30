@@ -52,7 +52,7 @@ MODEL_ID = os.getenv("MODEL_ID") or (
     "openai/gpt-oss-120b" if PROVIDER == "nebius" else "gpt-4.1-2025-04-14"
 )
 
-_VERSION = "0.5.1"
+_VERSION = "0.5.3"
 try:
     with Path(__file__).with_name("pyproject.toml").open("rb") as _f:
         import tomllib
