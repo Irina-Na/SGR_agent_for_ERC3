@@ -285,6 +285,8 @@ It:
 - Identity tool: {f"/bin/{discovery.identity_tool}" if discovery.identity_tool else "(not discovered)"}
 - Time tool: {f"/bin/{discovery.time_tool}" if discovery.time_tool else "(not discovered)"}
 - SQL tool: {f"/bin/{discovery.sql_tool}" if discovery.sql_tool else "(not discovered)"}
+- SQL schema snapshot (table/column names rotate per run — read this, do not guess):
+{discovery.schema_snapshot or "(not captured)"}
 
 # Operating rules (agent mechanics; the /AGENTS.MD rules above are authoritative for content/format)
 - Stay focused: read only what the task needs; don't churn.

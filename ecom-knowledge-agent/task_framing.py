@@ -87,6 +87,53 @@ def refresh_docs_for_trial(rt, discovery: SessionDiscovery) -> SessionDiscovery:
     })
 
 
+def refresh_schema_for_trial(rt, discovery: SessionDiscovery) -> SessionDiscovery:
+    """Per-trial SQL schema refresh — schemas can rotate between trials in the
+    same run (prime directive: table/column names are mutable). Re-dump via the
+    runtime's sql_raw so the call counts against the evidence ledger like any
+    other tool use.
+
+    Returns a copy with the refreshed `schema_snapshot`; on any failure or empty
+    result, returns the original discovery unchanged so today's behaviour stands.
+    """
+    if not discovery.sql_tool:
+        return discovery
+    try:
+        base = rt.sql_raw(
+            "SELECT name, type, sql FROM sqlite_schema WHERE sql IS NOT NULL "
+            "ORDER BY type, name;"
+        )
+    except Exception:  # noqa: BLE001
+        return discovery
+    if not base.strip():
+        return discovery
+    import re as _re
+    table_re = _re.compile(
+        r"create\s+table\s+(?:if\s+not\s+exists\s+)?[\"\[`]?([A-Za-z_][A-Za-z0-9_]*)",
+        _re.IGNORECASE,
+    )
+    chunks = ["# sqlite_schema\n" + base.rstrip()]
+    for name in sorted(set(table_re.findall(base))):
+        try:
+            cols = rt.sql_raw(f"PRAGMA table_info({name});")
+        except Exception:  # noqa: BLE001
+            continue
+        if cols.strip():
+            chunks.append(f"# PRAGMA table_info({name})\n{cols.rstrip()}")
+    snapshot = "\n\n".join(chunks)
+    return discovery.model_copy(update={"schema_snapshot": snapshot})
+
+
+def format_schema_diag(baseline_len: int, trial_len: int) -> str:
+    """One-line diag mirroring FRAMING DIAG: shows baseline vs trial size and
+    char-delta so a grep over the run reveals schema drift quickly."""
+    delta = trial_len - baseline_len
+    return (
+        f"SCHEMA DIAG: baseline_chars={baseline_len} trial_chars={trial_len} "
+        f"delta={delta:+d}"
+    )
+
+
 def format_framing_diag(
     framing: "FramingResult",
     catalog_size: int,

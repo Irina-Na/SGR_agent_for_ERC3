@@ -10,13 +10,14 @@ trials within a run, so in-memory reuse is sufficient.
 from __future__ import annotations
 
 import json
+import re
 from typing import Dict, List, Literal, Optional
 
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from bitgn.vm.ecom.ecom_connect import EcomRuntimeClientSync
-from bitgn.vm.ecom.ecom_pb2 import NodeKind, Outcome, ReadRequest, TreeRequest
+from bitgn.vm.ecom.ecom_pb2 import ExecRequest, NodeKind, Outcome, ReadRequest, TreeRequest
 
 
 class SessionDiscovery(BaseModel):
@@ -42,6 +43,11 @@ class SessionDiscovery(BaseModel):
     # Schema-agnostic — discovered by sampling, never hardcoded (see prime directive).
     identity_columns: Dict[str, dict] = Field(default_factory=dict)
     identity_built: bool = False
+
+    # Run-scoped SQL schema dump (raw stdout from the discovered sql_tool). The
+    # format is NOT a prod invariant — we ship the bytes and let the model read
+    # them. Empty string when sql_tool wasn't discovered or the dump failed.
+    schema_snapshot: str = ""
 
 
 # ---- structured-output schema for the one LLM classification call ----
@@ -116,6 +122,47 @@ def _collect_docs_paths(vm: EcomRuntimeClientSync) -> List[str]:
 
 def _outcome_enum_names() -> List[str]:
     return [v.name for v in Outcome.DESCRIPTOR.values]
+
+
+_TABLE_NAME_RE = re.compile(
+    r"create\s+table\s+(?:if\s+not\s+exists\s+)?[\"\[`]?([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+
+
+def _sql_exec(vm: EcomRuntimeClientSync, sql_tool: str, query: str) -> str:
+    """Run a query via the discovered SQL tool; return raw stdout, "" on error."""
+    try:
+        r = vm.exec(ExecRequest(path=f"/bin/{sql_tool}", args=[], stdin=query))
+        return getattr(r, "stdout", "") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _dump_schema(vm: EcomRuntimeClientSync, sql_tool: Optional[str]) -> str:
+    """Raw schema dump for the system prompt. Best-effort, format-agnostic.
+
+    Tries sqlite_schema first; if that returns anything, follows up with
+    PRAGMA table_info for every CREATE TABLE name we can parse out. The whole
+    thing is one concatenated string — the model reads it as text. Empty on any
+    failure (no sql_tool, exec error, unfamiliar dialect).
+    """
+    if not sql_tool:
+        return ""
+    base = _sql_exec(
+        vm, sql_tool,
+        "SELECT name, type, sql FROM sqlite_schema WHERE sql IS NOT NULL "
+        "ORDER BY type, name;",
+    )
+    if not base.strip():
+        return ""
+    chunks = ["# sqlite_schema\n" + base.rstrip()]
+    names = sorted(set(_TABLE_NAME_RE.findall(base)))
+    for name in names:
+        cols = _sql_exec(vm, sql_tool, f"PRAGMA table_info({name});")
+        if cols.strip():
+            chunks.append(f"# PRAGMA table_info({name})\n{cols.rstrip()}")
+    return "\n\n".join(chunks)
 
 
 def _extract_json_candidate(content: str) -> str:
@@ -212,6 +259,8 @@ def discover(
             doc_triggers=[],
         )
 
+    schema_snapshot = _dump_schema(vm, cls.sql_tool)
+
     return SessionDiscovery(
         tool_index={tc.tool_name: tc.classification for tc in cls.tool_classifications},
         identity_tool=cls.identity_tool,
@@ -225,4 +274,5 @@ def discover(
         bin_tree_text=bin_tree,
         docs_tree_text=docs_tree,
         proc_tree_text=proc_tree,
+        schema_snapshot=schema_snapshot,
     )

@@ -123,13 +123,25 @@ def resolve_ref(rt: EcomRuntime, idmap: dict[str, dict], ref: str):
     return "zero", None
 
 
+_AMBIGUOUS_EXPANSION_CAP = 20
+
+
 def repair_grounding_refs(rt: EcomRuntime, discovery: SessionDiscovery, report) -> list[str]:
     """Substitute resolvable bare-id / unseen-path refs with real object paths.
 
     Mutates report.grounding_refs in place. Returns a list of "Synthetic
     Correction" log lines (code, not the LLM, supplied the final precision) so the
-    trace stays honest. Refs that already resolve to a seen path, /docs refs, and
-    unresolvable refs are left untouched (the gate handles the latter)."""
+    trace stays honest.
+
+    Cases:
+      - ref already resolves to a known /-rooted path or a /docs path → kept.
+      - bare id resolves to exactly one path → substituted (1-for-1).
+      - bare id resolves to many paths (e.g. a family_id → its products) → the
+        single ref is expanded into the list of paths, capped at
+        _AMBIGUOUS_EXPANSION_CAP. This is the typical foreign-key fan-out and
+        the gate wants concrete paths, so emit them all rather than leaving
+        the bare ID in to be rejected.
+      - bare id resolves to nothing → left untouched (the gate rejects it)."""
     idmap = get_identity_map(rt, discovery)
     if not idmap:
         return []
@@ -137,16 +149,34 @@ def repair_grounding_refs(rt: EcomRuntime, discovery: SessionDiscovery, report) 
     known = rt.paths | set(discovery.docs_tree)
     corrections: list[str] = []
     new_refs: list[str] = []
+    seen: set[str] = set()  # dedup expanded refs across multiple bare-id inputs
+
+    def _append(p: str) -> None:
+        if p not in seen:
+            seen.add(p)
+            new_refs.append(p)
+
     for ref in report.grounding_refs or []:
         base = ref.split("#", 1)[0].rstrip("/")
         if ref.startswith("/") and (base in known or base.startswith("/docs/")):
-            new_refs.append(ref)
+            _append(ref)
             continue
         status, payload = resolve_ref(rt, idmap, ref)
         if status == "resolved":
-            new_refs.append(payload)
+            _append(payload)
             corrections.append(f"Synthetic Correction: '{ref}' -> '{payload}' (SQL id->path)")
+        elif status == "ambiguous":
+            paths = payload[:_AMBIGUOUS_EXPANSION_CAP]
+            for p in paths:
+                _append(p)
+            note = (
+                f"Synthetic Correction: '{ref}' -> {len(paths)} paths "
+                f"(SQL id->paths, fan-out)"
+            )
+            if len(payload) > _AMBIGUOUS_EXPANSION_CAP:
+                note += f"; truncated from {len(payload)}"
+            corrections.append(note)
         else:
-            new_refs.append(ref)
+            _append(ref)
     report.grounding_refs = new_refs
     return corrections

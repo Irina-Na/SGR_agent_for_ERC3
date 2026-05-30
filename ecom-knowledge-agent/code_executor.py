@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import builtins as _b
+import io as _io
 import json as _json
 import re as _re
 import threading
@@ -47,7 +48,10 @@ class SandboxError(Exception):
 # --- AST screen ---------------------------------------------------------------
 
 _BANNED_NAMES = frozenset({
-    "eval", "exec", "compile", "__import__", "open", "input",
+    "eval", "exec", "compile", "open", "input",
+    # `__import__` is provided via a restricted callable in _SAFE_BUILTINS so
+    # the import *statement* works for preloaded modules (json/re). Bare
+    # `__import__('os')` is rejected at runtime by that restricted callable.
     "setattr", "delattr",                       # mutate state — keep banned
     "globals", "locals", "vars", "dir", "type",
     "super", "breakpoint", "memoryview",
@@ -62,11 +66,27 @@ _BANNED_NAMES = frozenset({
 _GETATTR_FAMILY = frozenset({"getattr", "hasattr", "setattr", "delattr"})
 
 
+_PRELOADED_MODULES = frozenset({"json", "re"})
+
+
 def _screen_ast(source: str) -> None:
     tree = ast.parse(source, mode="exec")
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            raise SandboxError("imports are not allowed")
+        # Imports of PRELOADED modules (`import json`, `import re as r`, `from re
+        # import search`) are harmless — the module is already in the script's
+        # namespace and the `import` is a redundant no-op. Models keep writing
+        # them out of habit despite the prompt; rejecting was pure friction.
+        # All OTHER imports remain blocked (os, subprocess, etc.).
+        if isinstance(node, ast.Import):
+            offending = [a.name for a in node.names if a.name.split(".")[0] not in _PRELOADED_MODULES]
+            if offending:
+                raise SandboxError(f"imports not allowed (only json/re are preloaded): {offending}")
+            continue
+        if isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").split(".")[0]
+            if mod not in _PRELOADED_MODULES:
+                raise SandboxError(f"imports not allowed (only json/re are preloaded): from {node.module}")
+            continue
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             # blocks .__class__, .__bases__, .__subclasses__, etc., and also
             # any private attribute access. Slightly conservative but cheap.
@@ -95,13 +115,90 @@ def _screen_ast(source: str) -> None:
 _SAFE_BUILTIN_NAMES = (
     "abs", "all", "any", "bool", "dict", "divmod", "enumerate", "filter",
     "float", "frozenset", "int", "isinstance", "issubclass",
+    "iter", "next",                                         # iterator protocol
     "len", "list", "map", "max", "min", "pow", "range", "reversed", "round",
     "set", "slice", "sorted", "str", "sum", "tuple", "zip",
     "repr", "chr", "ord", "bin", "hex", "oct", "format", "print",
     "getattr", "hasattr",   # AST screen still rejects literal dunder/private names
+    # Exception classes — honest scripts use try/except for fragile parsing.
+    # These are types only; they perform no I/O.
+    "Exception", "BaseException", "ValueError", "TypeError", "KeyError",
+    "IndexError", "AttributeError", "StopIteration", "ArithmeticError",
+    "ZeroDivisionError", "RuntimeError", "LookupError",
 )
 _SAFE_BUILTINS: dict[str, Any] = {n: getattr(_b, n) for n in _SAFE_BUILTIN_NAMES}
 _SAFE_BUILTINS.update({"True": True, "False": False, "None": None})
+
+# Restricted `__import__` so that the Python `import` statement actually works
+# for preloaded modules — `import json`, `import re as r`, `from re import search`.
+# Everything else raises ImportError. The model frequently writes `import json`
+# out of habit even when told it's preloaded; this turns that habit into a no-op
+# instead of a fatal sandbox violation.
+_ALLOWED_IMPORTS: dict[str, Any] = {"json": _json, "re": _re}
+
+
+def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = name.split(".")[0]
+    if root not in _ALLOWED_IMPORTS:
+        raise ImportError(f"module not available in sandbox: {name!r}")
+    return _ALLOWED_IMPORTS[root]
+
+
+_SAFE_BUILTINS["__import__"] = _restricted_import
+
+
+# --- SQL parameter binding ----------------------------------------------------
+
+def _bind_value(v: Any) -> str:
+    """Render a Python value as a SQL literal. Mirrors sqlite3 type adaptation
+    closely enough for the queries scripts actually write: None→NULL, bool→0/1,
+    numbers as-is, everything else single-quote-escaped string."""
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    s = str(v).replace("'", "''")
+    return f"'{s}'"
+
+
+def _bind_params(query: str, params) -> str:
+    """Substitute `?` placeholders in `query` with values from `params`, matching
+    the sqlite3 cursor.execute(query, params) contract every model already knows.
+
+    Models call `rt.sql("SELECT ... WHERE id = ?", (x,))` out of habit; without
+    this they get a cryptic positional-args TypeError. Substitution happens
+    BEFORE the SQL tool sees the string, so it's the same architecture as if
+    the script had built the string itself with f-strings — just safer and
+    matching the expected API.
+
+    A `:name` style dict binding is also accepted: `rt.sql("... WHERE id = :id",
+    {"id": x})`. Mismatched counts raise so the script gets a clear error."""
+    if not params:
+        return query
+    if isinstance(params, dict):
+        # :name substitution. Sort by name length desc so :foo doesn't match :foobar prefix.
+        for name in sorted(params, key=len, reverse=True):
+            query = query.replace(f":{name}", _bind_value(params[name]))
+        return query
+    if isinstance(params, (str, bytes)):
+        # User probably meant a single-element tuple; refuse the ambiguous case.
+        raise TypeError(
+            "rt.sql params must be a tuple/list/dict, not a bare string. "
+            "Use (value,) for a single ? placeholder."
+        )
+    seq = list(params)
+    parts = query.split("?")
+    if len(parts) - 1 != len(seq):
+        raise ValueError(
+            f"rt.sql: query has {len(parts) - 1} ? placeholders but got {len(seq)} params"
+        )
+    out = [parts[0]]
+    for i, val in enumerate(seq):
+        out.append(_bind_value(val))
+        out.append(parts[i + 1])
+    return "".join(out)
 
 
 # --- budgeted runtime proxy ---------------------------------------------------
@@ -151,13 +248,13 @@ class _BudgetedRuntime:
         return self._rt.search(Req_Search(tool="search", pattern=pattern,
                                           root=root, limit=min(limit, 20)))
 
-    def sql(self, query: str) -> list[dict]:
+    def sql(self, query: str, params=()) -> list[dict]:
         self._check("sql")
-        return self._rt.sql(query)
+        return self._rt.sql(_bind_params(query, params))
 
-    def sql_raw(self, query: str) -> str:
+    def sql_raw(self, query: str, params=()) -> str:
         self._check("sql_raw")
-        return self._rt.sql_raw(query)
+        return self._rt.sql_raw(_bind_params(query, params))
 
     def exec(self, path: str, args=(), stdin: str = ""):
         self._check("exec")
@@ -178,10 +275,30 @@ class ExecOutcome:
     error: Optional[str] = None
     wrappers_used: int = 0
     timed_out: bool = False
+    captured_stdout: str = ""
 
     @property
     def ok(self) -> bool:
         return self.error is None
+
+
+_STDOUT_CAP = 32 * 1024  # bytes-of-text cap on captured Inspect/Answer stdout
+
+
+def _make_capture_print(buf: _io.StringIO):
+    """Drop-in replacement for `print` that writes into `buf` (bounded) and
+    silently truncates once the cap is hit. Mirrors `print()`'s sep/end/flush
+    semantics so model scripts behave the same as if they were printing to the
+    real stdout."""
+    def _print(*args, sep: str = " ", end: str = "\n", file=None, flush: bool = False):
+        text = sep.join(str(a) for a in args) + end
+        remaining = _STDOUT_CAP - buf.tell()
+        if remaining <= 0:
+            return
+        if len(text) > remaining:
+            text = text[:remaining]
+        buf.write(text)
+    return _print
 
 
 def run_script(
@@ -208,11 +325,18 @@ def run_script(
     timer.start()
 
     proxy = _BudgetedRuntime(rt, wrapper_budget, cancel)
+    stdout_buf = _io.StringIO()
+    # Per-call `print` writes into the local buffer instead of the real stdout
+    # so the Inspect phase can pipe the model's observations into the next LLM
+    # call. We swap it into a copy of _SAFE_BUILTINS to keep the module-level
+    # whitelist read-only and reusable across runs.
+    builtins_view = dict(_SAFE_BUILTINS)
+    builtins_view["print"] = _make_capture_print(stdout_buf)
     # `json` and `re` are preloaded — common script needs (parsing tool output,
     # tokenising) that would otherwise force `import`. Both are pure-stdlib and
     # do no I/O of their own. `re` ReDoS risk is bounded by the wall-clock timer.
     namespace: dict[str, Any] = {
-        "__builtins__": _SAFE_BUILTINS,
+        "__builtins__": builtins_view,
         "rt": proxy,
         "json": _json,
         "re": _re,
@@ -235,4 +359,5 @@ def run_script(
         error=error,
         wrappers_used=wrapper_budget - proxy._remaining,
         timed_out=timed_out,
+        captured_stdout=stdout_buf.getvalue(),
     )
