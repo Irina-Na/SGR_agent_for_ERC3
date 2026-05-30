@@ -41,7 +41,7 @@ from ecom_runtime import EcomRuntime
 from ecom_discovery import SessionDiscovery, discover
 from contract_validator import validate_report
 from resolvers import repair_grounding_refs
-from task_framing import frame_task
+from task_framing import format_framing_diag, frame_task, refresh_docs_for_trial
 
 
 MAX_VALIDATION_RETRIES = 3
@@ -287,13 +287,14 @@ It:
 - SQL tool: {f"/bin/{discovery.sql_tool}" if discovery.sql_tool else "(not discovered)"}
 
 # Operating rules (agent mechanics; the /AGENTS.MD rules above are authoritative for content/format)
-- Keep work small and targeted; consult the relevant /docs policy before acting on data it governs.
-- Grounding: only put a path in grounding_refs if that EXACT string was returned by a tool this session (a read target, or a cell/line in list/tree/find/search/SQL output). Never fabricate or reconstruct a path from an id or name. Every object exists as a file under /proc and is mirrored in SQL, so its real path is always obtainable — locate the object, then cite the string the tool returned.
+- Stay focused: read only what the task needs; don't churn.
+- Consult the relevant /docs policy before acting on data it governs.
+- Grounding: only put a path in grounding_refs if that EXACT string was returned by a tool this trial (a read target, or a cell/line in list/tree/find/search/SQL output). Never fabricate or reconstruct a path from an id or name. Every object exists as a file under /proc and is mirrored in SQL, so its real path is always obtainable — locate the object, then cite the string the tool returned.
 - Do not cite bare directories, table/column shorthand, or tool paths — cite concrete object files.
 - If you apply or rely on a policy document, cite it.
-- Do not compute counts/sums/totals yourself; obtain the value from a tool result and use it verbatim.
-- Count/aggregate procedure (for any "how many", count, sum, or total task): (1) first reflect the SQL schema to see the real tables, columns, and relationships — do not assume them; (2) when the request names a category/type/kind, find the table that holds that taxonomy and inspect its DISTINCT values to map the request wording to the actual stored value(s) — a request phrase may map to one stored value or several; (3) filter by JOINing that taxonomy table on its key, NOT by substring-matching a free-text descriptive name column (those describe the item, not its category); (4) confirm the counting grain the question asks for (e.g. distinct products vs. individual variants/rows) before running COUNT/SUM; (5) read the answer off the SQL result verbatim.
-- Finish with report_completion using the outcome that matches the task state.
+- Numeric values must come from tool/runtime data — never invented or estimated. You may compute (sum, count, average) only over inputs you obtained from tool calls.
+- Count/aggregate procedure (for any "how many", count, sum, or total task): (1) first reflect the SQL schema to see the real tables, columns, and relationships — do not assume them; (2) when the request names a category/type/kind, find the table that holds that taxonomy and inspect its DISTINCT values to map the request wording to the actual stored value(s) — a request phrase may map to one stored value or several; (3) filter by JOINing that taxonomy table on its key, NOT by substring-matching a free-text descriptive name column (those describe the item, not its category); (4) confirm the counting grain the question asks for (e.g. distinct products vs. individual variants/rows) before counting; (5) the final value must come from a SQL aggregate OR a computation directly over tool-fetched rows — never invented.
+- Conclude with the outcome that matches the task state (the specific mechanism for emitting the final answer is defined in the Output contract section below).
 """
 
 
@@ -560,9 +561,13 @@ def run_agent(
     # Task-framing pre-step: surface the /docs policy that GOVERNS this task (if any)
     # up front, so the agent works with the authoritative grain/filters/format from
     # step 1 instead of reasoning from the schema. Degrades to no-op when none matches.
-    framing = frame_task(task_text, discovery, client, model)
+    # Part A item 1: refresh /docs from THIS trial (run-hoisted snapshot can drift).
+    trial_discovery = refresh_docs_for_trial(rt, discovery)
+    drift = len(trial_discovery.docs_tree) - len(discovery.docs_tree)
+    framing = frame_task(task_text, trial_discovery, client, model)
     paths = framing.governing_doc_paths
     if len(paths) == 1 and framing.confident:
+        ladder = "authoritative"
         p = paths[0]
         try:
             content = rt.read(Req_Read(tool="read", path=p)).content
@@ -574,7 +579,9 @@ def run_agent(
             )})
         except ConnectError as exc:
             print(f"{CLI_YELLOW}FRAMING: could not read {p}: {exc.message}{CLI_CLR}")
+            ladder = "none"  # injection failed → degrade
     elif paths:
+        ladder = "candidates"
         print(f"{CLI_BLUE}FRAMING: {len(paths)} candidate policies (ambiguous scope){CLI_CLR}")
         listing = "\n".join(f"- {p}" for p in paths)
         log.append({"role": "user", "content": (
@@ -582,6 +589,11 @@ def run_agent(
             "scope (e.g. location/time/workflow) the task actually requires, then read "
             "and apply that one before answering:\n" + listing
         )})
+    else:
+        ladder = "none"
+    # Part A item 2: always emit one diagnostic line (miss or hit). Coverage metric
+    # (item 3) is computed by grepping these lines across a run — see plan §2.
+    print(format_framing_diag(framing, len(trial_discovery.docs_tree), ladder, drift))
 
     # Evidence ledger lives inside the runtime (rt.paths / rt.docs_read), populated
     # on every wrapper call — robust to output-format changes.

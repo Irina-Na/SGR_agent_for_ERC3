@@ -35,6 +35,8 @@ from typing import List
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from api_tools import Req_Tree
+from bitgn.vm.ecom.ecom_pb2 import NodeKind
 from ecom_discovery import SessionDiscovery
 
 
@@ -42,6 +44,76 @@ class FramingResult(BaseModel):
     governing_doc_paths: List[str] = Field(default_factory=list)
     confident: bool = False
     reason: str = ""
+
+
+def _walk_docs(node, prefix: str, out: List[str]) -> None:
+    for child in node.children:
+        p = f"{prefix}/{child.name}"
+        if child.kind == NodeKind.NODE_KIND_FILE:
+            out.append(p)
+        elif child.kind == NodeKind.NODE_KIND_DIR:
+            _walk_docs(child, p, out)
+
+
+def refresh_docs_for_trial(rt, discovery: SessionDiscovery) -> SessionDiscovery:
+    """Part A item 1 — per-trial `/docs` refresh (invariant 3: `tree /docs` at trial start).
+
+    Returns a SessionDiscovery copy whose `docs_tree` reflects THIS trial's `/docs`
+    (not the run-1 hoisted snapshot, which we've measured drifts across trials).
+    `policy_doc_index` is filtered to surviving paths so stale triggers can't
+    misdirect framing; new paths get an empty trigger list (Pass-1 may miss them
+    until Part B's content-fallback ships — that is the planned, named limit).
+
+    Fail-soft: on any RPC/walk failure, returns the original discovery unchanged.
+    """
+    try:
+        result = rt.tree(Req_Tree(tool="tree", root="/docs", level=0))
+    except Exception:
+        return discovery
+    paths: List[str] = []
+    try:
+        _walk_docs(result.root, "/docs", paths)
+    except Exception:
+        return discovery
+    if not paths:
+        return discovery
+    surviving_index = {
+        p: discovery.policy_doc_index.get(p, [])
+        for p in paths
+    }
+    return discovery.model_copy(update={
+        "docs_tree": paths,
+        "policy_doc_index": surviving_index,
+    })
+
+
+def format_framing_diag(
+    framing: "FramingResult",
+    catalog_size: int,
+    ladder: str,
+    drift: int = 0,
+) -> str:
+    """Part A item 2 — one diagnostic line per framing call, miss or hit.
+
+    `ladder` is one of {"authoritative", "candidates", "none"}. `drift` is the
+    delta between the trial's current `/docs` size and the run-scoped snapshot
+    (positive = trial sees more docs than discovery captured; negative = fewer).
+    The diag is grep-friendly: `FRAMING DIAG:` prefix, `key=value` fields.
+
+    Coverage metric (Part A item 3) is computed by grepping these lines across
+    a run — no aggregator code yet on purpose; we want a numeric coverage read
+    before deciding whether to build one.
+    """
+    n = len(framing.governing_doc_paths)
+    paths_field = ",".join(framing.governing_doc_paths) if framing.governing_doc_paths else "-"
+    reason = (framing.reason or "").replace("\n", " ").replace("\r", " ").strip()
+    if len(reason) > 200:
+        reason = reason[:197] + "..."
+    return (
+        f"FRAMING DIAG: catalog={catalog_size} drift={drift:+d} selected={n} "
+        f"confident={framing.confident} ladder={ladder} "
+        f"paths=[{paths_field}] reason=\"{reason}\""
+    )
 
 
 _SYSTEM = """You decide which discovered policy/reference document (if any) GOVERNS the answer to a specific task in this environment.

@@ -32,7 +32,12 @@ from bitgn.harness_pb2 import (
 from bitgn.vm.ecom.ecom_connect import EcomRuntimeClientSync
 
 from agent import get_llm_client, run_agent
+from coding_executor import run_agent_coding
 from ecom_discovery import SessionDiscovery, discover
+
+# EXECUTOR=coding routes to the Phase-3 sandboxed coding sub-executor;
+# anything else (or unset) keeps the Phase 0-2 step loop.
+_EXECUTOR = run_agent_coding if (os.getenv("EXECUTOR", "").lower() == "coding") else run_agent
 
 
 BITGN_URL = (
@@ -47,11 +52,11 @@ MODEL_ID = os.getenv("MODEL_ID") or (
     "openai/gpt-oss-120b" if PROVIDER == "nebius" else "gpt-4.1-2025-04-14"
 )
 
-_VERSION = "0.4.2"
+_VERSION = "0.5.1"
 try:
     with Path(__file__).with_name("pyproject.toml").open("rb") as _f:
         import tomllib
-        _VERSION = tomllib.load(_f).get("project", {}).get("version", _VERSION_DEFAULT)
+        _VERSION = tomllib.load(_f).get("project", {}).get("version", _VERSION)
 except Exception:
     pass
 VERSION = _VERSION
@@ -152,7 +157,7 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
                 print(f"{'=' * 30} Starting task: {trial.task_id} {'=' * 30}")
                 print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
                 try:
-                    run_agent(
+                    _EXECUTOR(
                         MODEL_ID,
                         trial.harness_url,
                         trial.instruction,
