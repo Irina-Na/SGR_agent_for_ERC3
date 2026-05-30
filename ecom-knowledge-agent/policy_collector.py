@@ -12,13 +12,13 @@ import re
 from typing import Dict, Iterable, List, Literal, Tuple
 
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from api_tools import Req_Read
 from ecom_discovery import SessionDiscovery
 
 
-DOC_READ_LIMIT = 5
+DOC_READ_LIMIT = 8
 DOC_CONTEXT_CHAR_BUDGET = 24_000
 DOC_SNIPPET_CHAR_LIMIT = 7_000
 
@@ -78,6 +78,40 @@ def _extract_json(content: str) -> str:
     return text[start:end + 1].strip() if start != -1 and end != -1 and start < end else text
 
 
+def _first_balanced_object(text: str) -> str | None:
+    """Return the first balanced `{...}` block, ignoring braces inside strings.
+
+    Used as a repair step when the model emits two JSON objects back-to-back
+    (trailing-characters parse error). Returns None when no balanced object
+    can be found.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 def rank_doc_paths(
     task_text: str,
     discovery: SessionDiscovery,
@@ -85,9 +119,13 @@ def rank_doc_paths(
 ) -> List[Tuple[str, float, List[str]]]:
     """Deterministically rank docs by runtime text overlap.
 
-    This is a generic retrieval heuristic, not a task rule. It uses only doc
-    paths, LLM-discovered triggers, and the task text.
+    Generic retrieval heuristic, not a task rule. Uses only doc paths, LLM-
+    discovered triggers, and the task text. Tokens drive the main score; a
+    character-substring boost catches paraphrase misses (e.g. task "check the
+    basket out" should reach `/docs/checkout.md` whose token "checkout" never
+    matches the task tokens but appears as a substring of "check"+"out" joined).
     """
+    combined = (task_text + "\n" + runtime_context).lower()
     task_tokens = _tokens(task_text + "\n" + runtime_context)
     ranked: List[Tuple[str, float, List[str]]] = []
     for path in discovery.docs_tree or []:
@@ -101,6 +139,15 @@ def rank_doc_paths(
         if triggers:
             score += 0.5
         score += min(path.count("/"), 5) * 0.05
+        # Substring boost: any filename/trigger token of length >=5 that appears
+        # as a literal substring of the (lowercased) task text. Catches stems
+        # the tokenizer splits ("check"+"out" vs "checkout") without baking in
+        # any domain vocabulary.
+        substring_hits = sum(
+            1 for tok in (path_tokens | trigger_tokens)
+            if len(tok) >= 5 and tok in combined
+        )
+        score += substring_hits * 2.0
         ranked.append((path, score, overlap))
     ranked.sort(key=lambda item: (-item[1], item[0]))
     return ranked
@@ -108,7 +155,8 @@ def rank_doc_paths(
 
 def _read_doc(rt, path: str) -> str:
     try:
-        return rt.read(Req_Read(tool="read", path=path)).content or ""
+        reader = getattr(rt, "read_for_context", rt.read)
+        return reader(Req_Read(tool="read", path=path)).content or ""
     except Exception:
         return ""
 
@@ -375,7 +423,15 @@ def collect_task_policies(
             max_completion_tokens=4096,
         )
         content = resp.choices[0].message.content or ""
-        payload = _SelectionPayload.model_validate_json(_extract_json(content))
+        try:
+            payload = _SelectionPayload.model_validate_json(_extract_json(content))
+        except ValidationError:
+            # Model emitted two concatenated JSON objects ("trailing characters")
+            # or unbalanced output — try to recover the first balanced {…} block.
+            repaired = _first_balanced_object(content)
+            if repaired is None:
+                raise
+            payload = _SelectionPayload.model_validate_json(repaired)
         selections = _filter_known_selections(payload.selections, read_docs, ranked)
         if not selections:
             return _fallback_collection(read_docs, ranked, task_text, "LLM selected no usable docs")

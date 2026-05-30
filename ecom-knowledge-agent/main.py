@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import textwrap
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -46,13 +47,14 @@ BITGN_URL = (
     or "https://api.bitgn.com"
 )
 BITGN_API_KEY = os.getenv("BITGN_API_KEY") or ""
-BENCH_ID = os.getenv("BENCH_ID") or os.getenv("BENCHMARK_ID") or "bitgn/ecom1-dev"
+BENCH_ID = os.getenv("BENCH_ID") or os.getenv("BENCHMARK_ID") or "bitgn/ecom1-prod"
 PROVIDER = os.getenv("PROVIDER") or "nebius"  # "nebius" or "openai"
 MODEL_ID = os.getenv("MODEL_ID") or (
     "openai/gpt-oss-120b" if PROVIDER == "nebius" else "gpt-4.1-2025-04-14"
 )
+PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS", "6"))
 
-_VERSION = "0.5.3"
+_VERSION = "0.5.4"
 try:
     with Path(__file__).with_name("pyproject.toml").open("rb") as _f:
         import tomllib
@@ -111,6 +113,33 @@ def _unique_path(path: Path) -> Path:
     raise FileExistsError(f"Could not find a free report filename for {path}")
 
 
+def _run_trial(
+    trial,
+    discovery: SessionDiscovery,
+    run_stem: str,
+    trace_dir: Path | None,
+) -> None:
+    print(f"{'=' * 30} Starting task: {trial.task_id} {'=' * 30}")
+    print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
+    try:
+        _EXECUTOR(
+            MODEL_ID,
+            trial.harness_url,
+            trial.instruction,
+            provider=PROVIDER,
+            discovery=discovery.model_copy(deep=True),
+            trace_dir=trace_dir,
+            trace_prefix=f"{run_stem}_{trial.task_id}",
+        )
+    except Exception as exc:
+        print(exc)
+    finally:
+        HarnessServiceClientSync(BITGN_URL).end_trial(
+            EndTrialRequest(trial_id=trial.trial_id)
+        )
+        print(f"\n{CLI_BLUE}Trial {trial.task_id} closed; score will be printed after run submit{CLI_CLR}\n")
+
+
 def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
     task_filter = os.sys.argv[1:]
     scores: list[tuple[str, float]] = []
@@ -133,6 +162,7 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
         ))
 
         try:
+            trials = []
             for trial_id in run.trial_ids:
                 trial = client.start_trial(StartTrialRequest(trial_id=trial_id))
                 if task_filter and trial.task_id not in task_filter:
@@ -154,23 +184,17 @@ def main(run_stem: str = "ecom", trace_dir: Path | None = None) -> float | None:
                         f"tools={len(discovery.tool_index)}{CLI_CLR}"
                     )
 
-                print(f"{'=' * 30} Starting task: {trial.task_id} {'=' * 30}")
-                print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
-                try:
-                    _EXECUTOR(
-                        MODEL_ID,
-                        trial.harness_url,
-                        trial.instruction,
-                        provider=PROVIDER,
-                        discovery=discovery,
-                        trace_dir=trace_dir,
-                        trace_prefix=f"{run_stem}_{trial.task_id}",
-                    )
-                except Exception as exc:
-                    print(exc)
+                trials.append(trial)
 
-                client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
-                print(f"\n{CLI_BLUE}Trial closed; score will be printed after run submit{CLI_CLR}\n")
+            if discovery is not None and trials:
+                print(f"{CLI_BLUE}Running {len(trials)} trials with parallelism={PARALLEL_TASKS}{CLI_CLR}")
+                with ThreadPoolExecutor(max_workers=PARALLEL_TASKS) as executor:
+                    futures = [
+                        executor.submit(_run_trial, trial, discovery, run_stem, trace_dir)
+                        for trial in trials
+                    ]
+                    for future in as_completed(futures):
+                        future.result()
         finally:
             print(f"\n{CLI_GREEN}>>>> Submitting run... <<<<{CLI_CLR}")
             client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))

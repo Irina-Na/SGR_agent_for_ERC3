@@ -29,10 +29,13 @@ from __future__ import annotations
 
 import ast
 import builtins as _b
+import collections as _collections
+import datetime as _datetime
 import io as _io
 import json as _json
 import re as _re
 import threading
+import typing as _typing
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -69,11 +72,21 @@ _BANNED_NAMES = frozenset({
 _GETATTR_FAMILY = frozenset({"getattr", "hasattr", "setattr", "delattr"})
 
 
-_PRELOADED_MODULES = frozenset({"json", "re"})
+_PRELOADED_MODULES = frozenset({"json", "re", "datetime", "collections", "typing"})
 
 
 def _screen_ast(source: str) -> None:
     tree = ast.parse(source, mode="exec")
+    # Top-level `return` at module scope is a SyntaxError at compile time with a
+    # confusing message ("'return' outside function"). Models do this when they
+    # think of the script as a function body. Catch it here with a clearer hint.
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Return):
+            raise SandboxError(
+                "top-level `return` is not allowed — the script runs as a module, "
+                "not a function. Assign to `message`, `grounding_refs`, `outcome`, "
+                "`completed_steps_laconic` at module scope instead."
+            )
     for node in ast.walk(tree):
         # Imports of PRELOADED modules (`import json`, `import re as r`, `from re
         # import search`) are harmless — the module is already in the script's
@@ -128,6 +141,10 @@ _SAFE_BUILTIN_NAMES = (
     "Exception", "BaseException", "ValueError", "TypeError", "KeyError",
     "IndexError", "AttributeError", "StopIteration", "ArithmeticError",
     "ZeroDivisionError", "RuntimeError", "LookupError",
+    "NameError", "UnicodeError", "UnicodeDecodeError", "UnicodeEncodeError",
+    "AssertionError", "NotImplementedError", "OverflowError",
+    "OSError", "FileNotFoundError", "NotADirectoryError", "IsADirectoryError",
+    "PermissionError", "SystemExit", "GeneratorExit", "FloatingPointError",
 )
 _SAFE_BUILTINS: dict[str, Any] = {n: getattr(_b, n) for n in _SAFE_BUILTIN_NAMES}
 _SAFE_BUILTINS.update({"True": True, "False": False, "None": None})
@@ -137,7 +154,10 @@ _SAFE_BUILTINS.update({"True": True, "False": False, "None": None})
 # Everything else raises ImportError. The model frequently writes `import json`
 # out of habit even when told it's preloaded; this turns that habit into a no-op
 # instead of a fatal sandbox violation.
-_ALLOWED_IMPORTS: dict[str, Any] = {"json": _json, "re": _re}
+_ALLOWED_IMPORTS: dict[str, Any] = {
+    "json": _json, "re": _re, "datetime": _datetime,
+    "collections": _collections, "typing": _typing,
+}
 
 
 def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -254,6 +274,15 @@ class _BudgetedRuntime:
             missing=True,
         )
 
+    @staticmethod
+    def _with_missing(r):
+        """Ensure the result exposes `.missing` (default False) so the model's
+        `if r.missing` / `not r.missing` checks work uniformly across real
+        protobuf responses and the empty placeholders above."""
+        if r is None or hasattr(r, "missing"):
+            return r
+        return _ResultProxy(r, False)
+
     # one method per typed wrapper; primitive args (script can't construct Req_*)
     def read(self, path: str, number: bool = False, start_line: int = 0, end_line: int = 0):
         self._check("read")
@@ -285,13 +314,33 @@ class _BudgetedRuntime:
 
     def find(self, name: str, root: str = "/", kind: str = "all", limit: int = 10):
         self._check("find")
-        return self._rt.find(Req_Find(tool="find", name=name, root=root,
-                                      kind=kind, limit=min(limit, 20)))
+        _kind_norm = {
+            "file": "files", "files": "files",
+            "dir": "dirs", "directory": "dirs", "directories": "dirs", "dirs": "dirs",
+            "all": "all", "any": "all", "": "all",
+        }
+        kind = _kind_norm.get((kind or "all").lower(), kind)
+        try:
+            resp = self._rt.find(Req_Find(tool="find", name=name, root=root,
+                                          kind=kind, limit=min(limit, 20)))
+        except Exception as exc:
+            if self._not_found(exc):
+                return []
+            raise
+        # Models routinely write `for m in rt.find(...)` and `len(rt.find(...))`.
+        # FindResponse is neither iterable nor len-able; return the list directly.
+        return list(getattr(resp, "matches", None) or getattr(resp, "entries", None) or [])
 
     def search(self, pattern: str, root: str = "/", limit: int = 10):
         self._check("search")
-        return self._rt.search(Req_Search(tool="search", pattern=pattern,
-                                          root=root, limit=min(limit, 20)))
+        try:
+            resp = self._rt.search(Req_Search(tool="search", pattern=pattern,
+                                              root=root, limit=min(limit, 20)))
+        except Exception as exc:
+            if self._not_found(exc):
+                return []
+            raise
+        return list(getattr(resp, "matches", None) or [])
 
     def sql(self, query: str, params=()) -> list[dict]:
         self._check("sql")
@@ -303,8 +352,41 @@ class _BudgetedRuntime:
 
     def exec(self, path: str, args=(), stdin: str = ""):
         self._check("exec")
-        return self._rt.exec(Req_Exec(tool="exec", path=path,
-                                      args=list(args), stdin=stdin))
+        try:
+            return self._rt.exec(Req_Exec(tool="exec", path=path,
+                                          args=list(args), stdin=stdin))
+        except Exception as exc:
+            if self._not_found(exc):
+                return SimpleNamespace(stdout="", stderr=str(getattr(exc, "message", exc)),
+                                       exit_code=127, missing=True)
+            raise
+
+    @property
+    def tools(self):
+        specs = getattr(self._rt, "tool_specs", {}) or {}
+        out = {}
+        for name, spec in specs.items():
+            if isinstance(spec, dict):
+                out[name] = {
+                    "path": spec.get("path", f"/bin/{name}"),
+                    "classification": spec.get("classification", "unknown"),
+                    "help": spec.get("help_text", ""),
+                }
+            else:
+                out[name] = {
+                    "path": getattr(spec, "path", f"/bin/{name}"),
+                    "classification": getattr(spec, "classification", "unknown"),
+                    "help": getattr(spec, "help_text", ""),
+                }
+        return out
+
+    def tool_help(self, name: str) -> str:
+        self._check("tool_help")
+        return self._rt.tool_help(name)
+
+    def run_tool(self, name: str, args=(), stdin: str = ""):
+        self._check("run_tool")
+        return self._rt.run_tool(name, args=args, stdin=stdin)
 
     # read-only view of the evidence ledger so scripts can prefer-cite seen paths
     @property
@@ -391,6 +473,9 @@ def run_script(
         "rt": proxy,
         "json": _json,
         "re": _re,
+        "datetime": _datetime,
+        "collections": _collections,
+        "typing": _typing,
     }
     error: Optional[str] = None
     try:

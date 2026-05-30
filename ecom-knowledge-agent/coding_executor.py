@@ -138,14 +138,20 @@ Runtime — the ONLY I/O surface is `rt.*` (these exact methods, nothing else ex
   rt.read(path, number=False, start_line=0, end_line=0)  -> obj with .content
   rt.list(path="/")          -> obj with .entries  (each entry has .name, .kind)
   rt.tree(root="", level=2)  -> obj with .root
-  rt.find(name, root="/", kind="all", limit=10)
-  rt.search(pattern, root="/", limit=10)
+  rt.find(name, root="/", kind="all", limit=10)   -> list of matches (each has .path)
+  rt.search(pattern, root="/", limit=10)           -> list of matches (each has .path, .line, .line_text)
   rt.sql(query, params=())    -> list[dict]  # ? or :name binds; values auto-quoted
   rt.sql_raw(query, params=()) -> str         # same binds; raw stdout
   rt.exec(path, args=(), stdin="")            # invoke a /bin/* utility
+  rt.tools                                    # dict of discovered /bin tools and help summaries
+  rt.tool_help(name) -> str                   # captured README/help for a discovered tool
+  rt.run_tool(name, args=(), stdin="")        # invoke discovered /bin tool by leaf name
   rt.paths                                     # frozenset of /-rooted paths SEEN this trial
 Do NOT invent methods (no `rt.list_tree`, no `rt.schema`, no `rt.query`). If a
 helper you want doesn't appear above, compose the same effect from what does.
+If SQL schema output is empty, inspect `rt.tools` and `rt.tool_help(...)` before
+writing SQL. Tool names rotate; prefer `rt.run_tool("name")` over hardcoded
+`rt.exec("/bin/name")` once the registry has shown the tool exists.
 
 Inspect mode is tolerant of missing optional filesystem paths: if `rt.read`,
 `rt.list`, or `rt.tree` targets a path that is absent in this trial, it returns an
@@ -233,12 +239,30 @@ Runtime — only I/O is `rt.*` (every call counts against a budget of {SCRIPT_WR
   rt.read(path, number=False, start_line=0, end_line=0)  -> obj with .content
   rt.list(path="/")          -> obj with .entries  (each entry has .name, .kind)
   rt.tree(root="", level=2)  -> obj with .root
-  rt.find(name, root="/", kind="all", limit=10)
-  rt.search(pattern, root="/", limit=10)
+  rt.find(name, root="/", kind="all", limit=10)   -> list of matches (each has .path)
+  rt.search(pattern, root="/", limit=10)           -> list of matches (each has .path, .line, .line_text)
   rt.sql(query, params=())    -> list[dict]  # ? or :name binds; values auto-quoted
   rt.sql_raw(query, params=()) -> str         # same binds; raw stdout
   rt.exec(path, args=(), stdin="")            # invoke a /bin/* utility
+  rt.tools                                    # dict of discovered /bin tools and help summaries
+  rt.tool_help(name) -> str                   # captured README/help for a discovered tool
+  rt.run_tool(name, args=(), stdin="")        # invoke discovered /bin tool by leaf name
   rt.paths                                     # frozenset of /-rooted paths SEEN this trial
+
+If SQL schema output is empty, inspect `rt.tools` and `rt.tool_help(...)` before
+writing SQL. Tool names rotate; prefer `rt.run_tool("name")` over hardcoded
+`rt.exec("/bin/name")` once the registry has shown the tool exists.
+
+Answer phase is tolerant of missing filesystem paths: `rt.read`/`rt.list`/`rt.tree`
+on an absent path returns an empty object with `.missing=True` instead of aborting;
+`rt.find`/`rt.search` return `[]`; `rt.exec` returns an empty-stdout result with
+`.missing=True` if the tool isn't found. Check `.missing` (or `len(...)==0`)
+before treating empty as evidence — do not conclude "not found" without that
+check. Never copy a path out of /docs content and assume it exists.
+
+Preloaded modules (no `import` needed; standard imports also work for these):
+`json`, `re`, `datetime`, `collections` (Counter/defaultdict/OrderedDict),
+`typing` (List/Dict/Optional/etc.). Other imports are blocked by the sandbox.
 
 **rt.sql() returns dict rows where EVERY value is a string** (CSV parse — no
 type coercion). Cast before numeric comparison: `int(row["qty"]) >= 1`, not
@@ -377,10 +401,40 @@ def _build_report(ns: dict) -> Optional[ReportTaskCompletion]:
 
 
 def _script_error_feedback(outcome: ExecOutcome) -> str:
+    err = outcome.error or ""
+    hint = ""
+    low = err.lower()
+    if "not found" in low and ("read" in low or "connecterror" in low):
+        hint = (
+            "\nHint: the path you read does not exist. Do NOT copy example paths "
+            "from /docs content as ground truth. Discover real paths via SQL "
+            "(the `record_path` cell mirroring /proc), `tree`, or `list` first."
+        )
+    elif "is a directory" in low:
+        hint = (
+            "\nHint: the path is a directory. Use `rt.list(path)` or `rt.tree(path)` "
+            "to enumerate it; only `rt.read` a concrete file."
+        )
+    elif "imports not allowed" in low or "module not available" in low:
+        hint = (
+            "\nHint: the sandbox preloads only `json` and `re`. Standard builtins "
+            "(dict, list, set, sorted, max, min, sum, etc.) are available without "
+            "imports. Rewrite using those."
+        )
+    elif "top-level `return`" in err:
+        hint = (
+            "\nHint: assign your final values to `message`, `grounding_refs`, "
+            "`outcome`, `completed_steps_laconic` at module scope. No `return`."
+        )
+    elif "req_find" in low and ("kind" in low or "literal" in low):
+        hint = (
+            "\nHint: `rt.find(name, root, kind, limit)` — `kind` must be one of "
+            "'all', 'files', 'dirs' (plural)."
+        )
     return (
         f"Your previous script failed: {outcome.error}\n"
         f"(wrappers used: {outcome.wrappers_used}/{SCRIPT_WRAPPER_BUDGET}; "
-        f"timed_out: {outcome.timed_out})\n"
+        f"timed_out: {outcome.timed_out}){hint}\n"
         "Fix it and return one corrected python fenced block."
     )
 
@@ -421,7 +475,7 @@ def run_agent_coding(
         print(f"{CLI_BLUE}Discovery (trial-scoped fallback)...{CLI_CLR}")
         discovery = discover(vm, client, model)
 
-    rt = EcomRuntime(vm, sql_tool=discovery.sql_tool)
+    rt = EcomRuntime(vm, sql_tool=discovery.sql_tool, tool_specs=discovery.tool_specs)
 
     # Build BOTH system prompts up front. The Inspect prompt forbids the
     # answer-contract variables; the Answer prompt requires them. They share
@@ -598,6 +652,7 @@ def run_agent_coding(
             script, rt,
             timeout_sec=SCRIPT_TIMEOUT_SEC,
             wrapper_budget=SCRIPT_WRAPPER_BUDGET,
+            tolerate_not_found=True,
         )
         if not outcome.ok:
             print(f"{CLI_YELLOW}script error: {outcome.error}{CLI_CLR}")

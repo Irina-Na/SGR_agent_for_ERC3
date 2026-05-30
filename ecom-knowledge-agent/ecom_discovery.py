@@ -20,10 +20,19 @@ from bitgn.vm.ecom.ecom_connect import EcomRuntimeClientSync
 from bitgn.vm.ecom.ecom_pb2 import ExecRequest, NodeKind, Outcome, ReadRequest, TreeRequest
 
 
+class ToolSpec(BaseModel):
+    name: str
+    path: str
+    classification: Literal["mutating", "read_only", "unknown"] = "unknown"
+    help_text: str = ""
+    readme_path: Optional[str] = None
+
+
 class SessionDiscovery(BaseModel):
     """Run-scoped knowledge about the ECOM environment."""
 
     tool_index: Dict[str, Literal["mutating", "read_only", "unknown"]] = Field(default_factory=dict)
+    tool_specs: Dict[str, ToolSpec] = Field(default_factory=dict)
     identity_tool: Optional[str] = None
     time_tool: Optional[str] = None
     sql_tool: Optional[str] = None
@@ -120,6 +129,58 @@ def _collect_docs_paths(vm: EcomRuntimeClientSync) -> List[str]:
     return paths
 
 
+def _collect_bin_tools(vm: EcomRuntimeClientSync) -> List[str]:
+    """Collect /bin leaf tool names from the live tree."""
+    result = vm.tree(TreeRequest(root="/bin", level=1))
+    return [
+        child.name for child in result.root.children
+        if child.kind in (NodeKind.NODE_KIND_FILE, NodeKind.NODE_KIND_DIR)
+    ]
+
+
+def _read_optional(vm: EcomRuntimeClientSync, path: str) -> str:
+    try:
+        return vm.read(ReadRequest(path=path)).content or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _exec_optional(vm: EcomRuntimeClientSync, path: str, args: List[str]) -> str:
+    try:
+        result = vm.exec(ExecRequest(path=path, args=args, stdin=""))
+    except Exception:  # noqa: BLE001
+        return ""
+    parts = []
+    if getattr(result, "stdout", ""):
+        parts.append(result.stdout.rstrip())
+    if getattr(result, "stderr", ""):
+        parts.append("stderr:\n" + result.stderr.rstrip())
+    return "\n".join(parts).strip()
+
+
+def _collect_tool_specs(
+    vm: EcomRuntimeClientSync,
+    tool_names: List[str],
+    classifications: Dict[str, Literal["mutating", "read_only", "unknown"]],
+) -> Dict[str, ToolSpec]:
+    specs: Dict[str, ToolSpec] = {}
+    for name in tool_names:
+        path = f"/bin/{name}"
+        readme_path = f"{path}/README.md"
+        readme = _read_optional(vm, readme_path)
+        help_text = readme
+        if not help_text.strip():
+            help_text = _exec_optional(vm, path, ["--help"])
+        specs[name] = ToolSpec(
+            name=name,
+            path=path,
+            classification=classifications.get(name, "unknown"),
+            help_text=help_text[:4000],
+            readme_path=readme_path if readme else None,
+        )
+    return specs
+
+
 def _outcome_enum_names() -> List[str]:
     return [v.name for v in Outcome.DESCRIPTOR.values]
 
@@ -139,30 +200,80 @@ def _sql_exec(vm: EcomRuntimeClientSync, sql_tool: str, query: str) -> str:
         return ""
 
 
-def _dump_schema(vm: EcomRuntimeClientSync, sql_tool: Optional[str]) -> str:
-    """Raw schema dump for the system prompt. Best-effort, format-agnostic.
+_INTROSPECTION_QUERIES = (
+    # SQLite
+    ("sqlite_schema",
+     "SELECT name, type, sql FROM sqlite_schema WHERE sql IS NOT NULL "
+     "ORDER BY type, name;"),
+    # Postgres / MySQL / standard SQL
+    ("information_schema.tables",
+     "SELECT table_schema, table_name FROM information_schema.tables "
+     "WHERE table_schema NOT IN "
+     "('pg_catalog','information_schema','sys','mysql','performance_schema') "
+     "ORDER BY table_schema, table_name;"),
+)
 
-    Tries sqlite_schema first; if that returns anything, follows up with
-    PRAGMA table_info for every CREATE TABLE name we can parse out. The whole
-    thing is one concatenated string — the model reads it as text. Empty on any
-    failure (no sql_tool, exec error, unfamiliar dialect).
+
+def dump_schema(sql_exec_fn, entity_kinds=None) -> str:
+    """Raw schema dump for the system prompt. Format-agnostic, multi-dialect.
+
+    `sql_exec_fn(query)` -> raw stdout str (""/None on failure; must not raise).
+
+    Strategy: try standard introspection queries (SQLite + information_schema),
+    then PRAGMA-probe any names parsed out, then always probe `SELECT * LIMIT 1`
+    against every discovered entity_kind (and its dash/underscore variants).
+    The entity-kind probes are the prod-safe baseline — they rely only on
+    invariant 4 (objects in /proc are mirrored in SQL) and work on any backend
+    that supports `SELECT * FROM <table> LIMIT 1`, surfacing column headers
+    even when no metadata view is queryable.
+
+    The result is one concatenated string; the model reads it as text. Empty
+    only when every probe returned nothing.
     """
-    if not sql_tool:
-        return ""
-    base = _sql_exec(
-        vm, sql_tool,
-        "SELECT name, type, sql FROM sqlite_schema WHERE sql IS NOT NULL "
-        "ORDER BY type, name;",
-    )
-    if not base.strip():
-        return ""
-    chunks = ["# sqlite_schema\n" + base.rstrip()]
-    names = sorted(set(_TABLE_NAME_RE.findall(base)))
-    for name in names:
-        cols = _sql_exec(vm, sql_tool, f"PRAGMA table_info({name});")
+    chunks: List[str] = []
+    detected: List[str] = []
+
+    for label, query in _INTROSPECTION_QUERIES:
+        out = sql_exec_fn(query) or ""
+        if not out.strip():
+            continue
+        chunks.append(f"# {label}\n{out.rstrip()}")
+        if label == "sqlite_schema":
+            detected.extend(_TABLE_NAME_RE.findall(out))
+        else:
+            # best-effort: last comma-separated token per line is table_name
+            for line in out.splitlines()[1:]:
+                parts = [p.strip().strip('"').strip("'") for p in line.split(",")]
+                if len(parts) >= 2 and parts[-1]:
+                    detected.append(parts[-1])
+
+    for name in sorted({n for n in detected if n}):
+        cols = sql_exec_fn(f"PRAGMA table_info({name});") or ""
         if cols.strip():
             chunks.append(f"# PRAGMA table_info({name})\n{cols.rstrip()}")
+
+    seen = {n for n in detected if n}
+    for ek in (entity_kinds or []):
+        for variant in (ek, ek.replace("-", "_"), ek.replace("_", "-")):
+            if not variant or variant in seen:
+                continue
+            seen.add(variant)
+            sample = sql_exec_fn(f"SELECT * FROM {variant} LIMIT 1;") or ""
+            if sample.strip():
+                chunks.append(f"# entity-kind probe: {variant}\n{sample.rstrip()}")
+
     return "\n\n".join(chunks)
+
+
+def _dump_schema(vm: EcomRuntimeClientSync, sql_tool: Optional[str],
+                 entity_kinds: Optional[List[str]] = None) -> str:
+    """discover()-time wrapper around `dump_schema` using the raw VM client."""
+    if not sql_tool:
+        return ""
+    return dump_schema(
+        lambda q: _sql_exec(vm, sql_tool, q),
+        entity_kinds=entity_kinds,
+    )
 
 
 def _extract_json_candidate(content: str) -> str:
@@ -221,6 +332,7 @@ def discover(
 
     entity_kinds = _collect_proc_kinds(vm)
     docs_paths = _collect_docs_paths(vm)
+    bin_tools = _collect_bin_tools(vm)
 
     # 6: one LLM call — JSON-schema-in-prompt + manual validate (same style as the
     # main loop; avoids constrained decoding that the Nebius/Qwen model handles poorly)
@@ -259,10 +371,17 @@ def discover(
             doc_triggers=[],
         )
 
-    schema_snapshot = _dump_schema(vm, cls.sql_tool)
+    tool_index = {tc.tool_name: tc.classification for tc in cls.tool_classifications}
+    # LLM classification may omit tools; keep every /bin leaf visible as unknown.
+    for name in bin_tools:
+        tool_index.setdefault(name, "unknown")
+    tool_specs = _collect_tool_specs(vm, bin_tools, tool_index)
+
+    schema_snapshot = _dump_schema(vm, cls.sql_tool, entity_kinds=entity_kinds)
 
     return SessionDiscovery(
-        tool_index={tc.tool_name: tc.classification for tc in cls.tool_classifications},
+        tool_index=tool_index,
+        tool_specs=tool_specs,
         identity_tool=cls.identity_tool,
         time_tool=cls.time_tool,
         sql_tool=cls.sql_tool,

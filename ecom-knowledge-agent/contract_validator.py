@@ -64,10 +64,16 @@ def sanitize_grounding_refs(
     original report instance is returned unchanged.
     """
     refs = list(report.grounding_refs or [])
+    known_valid = seen_paths | set(discovery.docs_tree)
     kept: list[str] = []
     dropped: list[str] = []
     for ref in refs:
-        if isinstance(ref, str) and ref.startswith("/"):
+        if not isinstance(ref, str) or not ref.startswith("/"):
+            dropped.append(ref)
+            continue
+        # Tolerate row/line provenance fragments — validate the underlying file.
+        base = ref.split("#", 1)[0].rstrip("/")
+        if base in known_valid:
             kept.append(ref)
         else:
             dropped.append(ref)

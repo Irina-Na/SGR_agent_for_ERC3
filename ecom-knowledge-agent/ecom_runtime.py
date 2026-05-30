@@ -85,6 +85,8 @@ def harvest_from_result(cmd, result) -> set[str]:
         return out
     if isinstance(cmd, Req_Read):
         out.add(cmd.path)
+    elif isinstance(cmd, Req_Write):
+        out.add(cmd.path)
     elif isinstance(cmd, Req_Tree):
         _walk_tree_files(result.root, cmd.root or "/", out)
     elif isinstance(cmd, Req_List):
@@ -107,19 +109,25 @@ def harvest_from_result(cmd, result) -> set[str]:
 class EcomRuntime:
     """Typed I/O surface + evidence ledger over the VM client."""
 
-    def __init__(self, vm: EcomRuntimeClientSync, sql_tool: str | None = None):
+    def __init__(
+        self,
+        vm: EcomRuntimeClientSync,
+        sql_tool: str | None = None,
+        tool_specs: dict | None = None,
+    ):
         self.vm = vm
         # Prod invariant: utilities live in /bin, but their NAMES are discovered,
         # not fixed. Never hardcode a tool name — if discovery didn't find the SQL
         # tool, sql() refuses rather than guessing a path that may not exist.
         self.sql_tool_path = f"/bin/{sql_tool}" if sql_tool else None
+        self.tool_specs = tool_specs or {}
         self.paths: set[str] = set()      # citeable file paths seen this trial
         self.docs_read: set[str] = set()  # /docs pages actually read
 
     # ---- ledger ----
-    def _record(self, cmd, result) -> None:
+    def _record(self, cmd, result, *, count_as_policy: bool = True) -> None:
         self.paths.update(harvest_from_result(cmd, result))
-        if isinstance(cmd, Req_Read) and cmd.path.startswith("/docs/"):
+        if count_as_policy and isinstance(cmd, Req_Read) and cmd.path.startswith("/docs/"):
             self.docs_read.add(cmd.path)
 
     # ---- typed wrappers (each records evidence, returns the raw RPC result) ----
@@ -153,6 +161,21 @@ class EcomRuntime:
         self._record(cmd, r)
         return r
 
+    def read_for_context(self, cmd: Req_Read):
+        """Read used as background context (e.g. policy-collector pre-read).
+
+        Updates `paths` so the result is still citeable, but does NOT mark the
+        doc as "policy applied" — only an agent-executed script doing rt.read
+        should set off the docs-citation gate. Without this split, the collector
+        reading top-K candidates would force a docs-cite violation on every task.
+        """
+        r = self.vm.read(ReadRequest(
+            path=cmd.path, number=cmd.number,
+            start_line=cmd.start_line, end_line=cmd.end_line,
+        ))
+        self._record(cmd, r, count_as_policy=False)
+        return r
+
     def write(self, cmd: Req_Write):
         r = self.vm.write(WriteRequest(path=cmd.path, content=cmd.content))
         self._record(cmd, r)
@@ -172,6 +195,23 @@ class EcomRuntime:
         r = self.vm.exec(ExecRequest(path=cmd.path, args=cmd.args, stdin=cmd.stdin))
         self._record(cmd, r)
         return r
+
+    def tool_help(self, name: str) -> str:
+        spec = self.tool_specs.get(name) or self.tool_specs.get(name.strip("/").split("/")[-1])
+        if spec is None:
+            return ""
+        if isinstance(spec, dict):
+            return spec.get("help_text", "") or ""
+        return getattr(spec, "help_text", "") or ""
+
+    def run_tool(self, name: str, args=(), stdin: str = ""):
+        leaf = name.strip("/").split("/")[-1]
+        return self.exec(Req_Exec(
+            tool="exec",
+            path=f"/bin/{leaf}",
+            args=list(args),
+            stdin=stdin,
+        ))
 
     def answer(self, cmd: ReportTaskCompletion):
         return self.vm.answer(AnswerRequest(

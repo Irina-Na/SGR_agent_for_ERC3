@@ -57,38 +57,26 @@ def refresh_docs_for_trial(rt, discovery: SessionDiscovery) -> SessionDiscovery:
 
 def refresh_schema_for_trial(rt, discovery: SessionDiscovery) -> SessionDiscovery:
     """Per-trial SQL schema refresh — schemas can rotate between trials in the
-    same run (prime directive: table/column names are mutable). Re-dump via the
-    runtime's sql_raw so the call counts against the evidence ledger like any
-    other tool use.
+    same run (prime directive: table/column names are mutable).
 
-    Returns a copy with the refreshed `schema_snapshot`; on any failure or empty
-    result, returns the original discovery unchanged.
+    Uses the same multi-dialect dump as discovery so any backend that responds
+    to `SELECT * FROM <entity_kind> LIMIT 1` produces a usable schema snapshot
+    even when no metadata view is queryable. Returns the original discovery
+    unchanged on empty/failure.
     """
     if not discovery.sql_tool:
         return discovery
-    try:
-        base = rt.sql_raw(
-            "SELECT name, type, sql FROM sqlite_schema WHERE sql IS NOT NULL "
-            "ORDER BY type, name;"
-        )
-    except Exception:
-        return discovery
-    if not base.strip():
-        return discovery
-    import re as _re
-    table_re = _re.compile(
-        r"create\s+table\s+(?:if\s+not\s+exists\s+)?[\"\[`]?([A-Za-z_][A-Za-z0-9_]*)",
-        _re.IGNORECASE,
-    )
-    chunks = ["# sqlite_schema\n" + base.rstrip()]
-    for name in sorted(set(table_re.findall(base))):
+    from ecom_discovery import dump_schema
+
+    def _safe(q: str) -> str:
         try:
-            cols = rt.sql_raw(f"PRAGMA table_info({name});")
+            return rt.sql_raw(q) or ""
         except Exception:
-            continue
-        if cols.strip():
-            chunks.append(f"# PRAGMA table_info({name})\n{cols.rstrip()}")
-    snapshot = "\n\n".join(chunks)
+            return ""
+
+    snapshot = dump_schema(_safe, entity_kinds=discovery.entity_kinds)
+    if not snapshot:
+        return discovery
     return discovery.model_copy(update={"schema_snapshot": snapshot})
 
 
